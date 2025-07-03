@@ -49,11 +49,22 @@ ERROR_SUBKEY_NOT_FOUND = 0x000006F7
 HKEY_CLASSES_ROOT = "HKCROOT"  # Registry entries subordinate to this key define types (or classes) of documents and the properties associated with those types. The subkeys of the HKEY_CLASSES_ROOT key are a merged view of the following two subkeys:
 HKEY_CURRENT_USER = "HKCU"  # Registry entries subordinate to this key define the preferences of the current user. These preferences include the settings of environment variables, data on program groups, colors, printers, network connections, and application preferences. The HKEY_CURRENT_USER root key is a subkey of the HKEY_USERS root key, as described in section 3.1.1.8.
 HKEY_LOCAL_MACHINE = "HKLM"  # Registry entries subordinate to this key define the physical state of the computer, including data on the bus type, system memory, and installed hardware and software.
-HKEY_CURRENT_CONFIG = ""  # This key contains information on the current hardware profile of the local computer.
+HKEY_CURRENT_CONFIG = "HKC"  # This key contains information on the current hardware profile of the local computer. HKEY_CURRENT_CONFIG is an alias for HKEY_LOCAL_MACHINE\System\CurrentControlSet\Hardware Profiles\Current
 HKEY_USERS = "HKU"
 HKEY_PERFORMANCE_DATA = "HKPERFORMANCE"  # Registry entries subordinate to this key allow access to performance data.
 HKEY_PERFORMANCE_TEXT = ""  # Registry entries subordinate to this key reference the text strings that describe counters in U.S. English.
 HKEY_PERFORMANCE_NLSTEXT = ""  # Registry entries subordinate to this key reference the text strings that describe counters in the local language of the area in which the computer is running.
+
+AVAILABLE_ROOT_KEYS: list[str] = [
+    HKEY_LOCAL_MACHINE,
+    HKEY_CURRENT_USER,
+    HKEY_USERS,
+    HKEY_CLASSES_ROOT,
+    HKEY_CURRENT_CONFIG,
+    HKEY_PERFORMANCE_DATA,
+    HKEY_PERFORMANCE_TEXT,
+    HKEY_PERFORMANCE_NLSTEXT,
+]
 
 
 @conf.commands.register
@@ -73,6 +84,8 @@ class regclient(CLIUtil):
     :param ST: if provided, the service ticket to use (Kerberos)
     :param KEY: if provided, the session key associated to the ticket (Kerberos)
     :param cli: CLI mode (default True). False to use for scripting
+    :param rootKey: the root key to get a handle to (HKLM, HKCU, etc.), in CLI mode you can chose it later
+
 
     Some additional SMB parameters are available under help(SMB_Client). Some of
     them include the following:
@@ -96,6 +109,7 @@ class regclient(CLIUtil):
         ST=None,
         KEY=None,
         cli=True,
+        rootKey: str = None,
         # SMB arguments
         **kwargs,
     ):
@@ -182,13 +196,17 @@ class regclient(CLIUtil):
         self.client.connect(target)
         self.client.open_smbpipe("winreg")
         self.client.bind(self.interface)
+        self.ls_cache: dict[str:list] = dict()
+        self.cat_cache: dict[str:list] = dict()
         self.root_handle = {}
         self.current_root_handle = None
-        self.current_root_path = "CHOOSE ROOT KEY"
         self.current_subkey_handle = None
         self.current_subkey_path: PureWindowsPath = pathlib.PureWindowsPath("")
-        self.ls_cache: dict[str:list] = dict()
-
+        if rootKey in AVAILABLE_ROOT_KEYS:
+            self.current_root_path = rootKey.strip()
+            self.use(self.current_root_path)
+        else:
+            self.current_root_path = "CHOOSE ROOT KEY"
         if cli:
             self.loop(debug=debug)
 
@@ -209,6 +227,7 @@ class regclient(CLIUtil):
         """
         Use base key (HKLM, HKCU, etc.)
         """
+        print(f">{root_path}<")
         if root_path.upper().startswith(HKEY_CLASSES_ROOT):
             # Change to HKLM root
             self.current_root_handle = self.root_handle.setdefault(
@@ -253,6 +272,17 @@ class regclient(CLIUtil):
 
         self.ls_cache.clear()
         self.cd("")
+
+    @CLIUtil.addcomplete(use)
+    def use_complete(self, root_key: str) -> list[str]:
+        """
+        Auto complete root key for `use`
+        """
+        return [
+            str(rkey)
+            for rkey in AVAILABLE_ROOT_KEYS
+            if str(rkey).lower().startswith(root_key.lower())
+        ]
 
     @CLIUtil.addcommand()
     def version(self):
@@ -345,6 +375,64 @@ class regclient(CLIUtil):
             for subk in self.ls()
             if str(subk).lower().startswith(folder.lower())
         ]
+
+    @CLIUtil.addcommand(spaces=True)
+    def cat(self, folder: Optional[str] = None) -> list[str]:
+        # If no specific folder was specified
+        # we use our current subkey path
+        if folder is None or folder == "":
+            cache = self.cat_cache.get(self.current_subkey_path)
+            subkey_path = self.current_subkey_path
+
+            # if the resolution was already performed,
+            # no need to query again the RPC
+            if cache:
+                return cache
+
+            # The first time we do a cat we need to get
+            # a proper handle
+            if self.current_subkey_handle is None:
+                self.current_subkey_handle = self.get_handle_on_subkey(
+                    PureWindowsPath("")
+                )
+
+            handle = self.current_subkey_handle
+
+        # Otherwise we use the folder path,
+        # the calling parent shall make sure that this path was properly sanitized
+        else:
+            subkey_path = self._join_path(self.current_subkey_path, folder)
+            handle = self.get_handle_on_subkey(subkey_path)
+            if handle is None:
+                return []
+
+        idx = 0
+        while True:
+            req = BaseRegEnumValue_Request(
+                hKey=handle,
+                dwIndex=idx,
+                lpValueNameIn=RPC_UNICODE_STRING(MaximumLength=1024),
+                lpData=b" " * 1024,
+                lpcbData=1024,
+                lpcbLen=1024,
+            )
+
+            resp = self.client.sr1_req(req)
+            if resp.status == ERROR_NO_MORE_ITEMS:
+                break
+            elif resp.status:
+                print(
+                    f"[-] Error : got status {hex(resp.status)} while enumerating values"
+                )
+                breakpoint()
+                self.cat_cache.clear()
+                return []
+
+            breakpoint()
+            self.ls_cache[subkey_path].append(
+                resp.lpNameOut.valueof("Buffer").decode("utf-8").strip("\x00")
+            )
+            idx += 1
 
     def _require_root_handles(self, silent: bool = False) -> bool:
         if self.current_root_handle is None:
