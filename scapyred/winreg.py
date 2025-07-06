@@ -2,6 +2,8 @@
 DCE/RPC client
 """
 
+from ctypes.wintypes import PFILETIME
+import re
 import socket
 import os
 import pathlib
@@ -33,6 +35,7 @@ from scapy.layers.dcerpc import find_dcerpc_interface, DCERPC_Transport
 from scapy.layers.ntlm import MD4le, NTLMSSP
 from scapy.layers.spnego import SPNEGOSSP
 from scapy.layers.kerberos import KerberosSSP
+from scapy.layers.smb2 import SECURITY_DESCRIPTOR
 
 from pathlib import PureWindowsPath
 
@@ -41,9 +44,11 @@ conf.color_theme = DefaultTheme()
 
 KEY_QUERY_VALUE = 0x00000001
 KEY_ENUMERATE_SUB_KEYS = 0x00000008
+STANDARD_RIGHTS_READ = 0x00020000  # Standard rights for read access
 MAX_ALLOWED = 0x02000000
 ERROR_NO_MORE_ITEMS = 0x00000103
 ERROR_SUBKEY_NOT_FOUND = 0x000006F7
+ERROR_INSUFFICIENT_BUFFER = 0x0000007A
 
 # Predefined keys
 HKEY_CLASSES_ROOT = "HKCROOT"  # Registry entries subordinate to this key define types (or classes) of documents and the properties associated with those types. The subkeys of the HKEY_CLASSES_ROOT key are a merged view of the following two subkeys:
@@ -65,6 +70,21 @@ AVAILABLE_ROOT_KEYS: list[str] = [
     HKEY_PERFORMANCE_TEXT,
     HKEY_PERFORMANCE_NLSTEXT,
 ]
+
+
+def from_filetime_to_datetime(lp_filetime: PFILETIME) -> str:
+    """
+    Convert a filetime to a human readable date
+    """
+    from datetime import datetime, timezone
+
+    filetime = lp_filetime.dwLowDateTime + (lp_filetime.dwHighDateTime << 32)
+    # Filetime is in 100ns intervals since 1601-01-01
+    # Convert to seconds since epoch
+    seconds = (filetime - 116444736000000000) // 10000000
+    return datetime.fromtimestamp(seconds, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
 
 @conf.commands.register
@@ -225,9 +245,21 @@ class regclient(CLIUtil):
     @CLIUtil.addcommand()
     def use(self, root_path):
         """
-        Use base key (HKLM, HKCU, etc.)
+        Selects and sets the base registry key (root) to use for subsequent operations.
+
+        Parameters:
+            root_path (str): The root registry path to use. Should start with one of the following:
+                - HKEY_CLASSES_ROOT
+                - HKEY_LOCAL_MACHINE
+                - HKEY_CURRENT_USER
+
+        Behavior:
+            - Determines which registry root to use based on the prefix of `root_path`.
+            - Opens the corresponding registry root handle if not already opened, using the appropriate request.
+            - Sets `self.current_root_handle` and `self.current_root_path` to the selected root.
+            - Clears the local subkey cache (`self.ls_cache`).
+            - Changes the current directory to the root of the selected registry hive.
         """
-        print(f">{root_path}<")
         if root_path.upper().startswith(HKEY_CLASSES_ROOT):
             # Change to HKLM root
             self.current_root_handle = self.root_handle.setdefault(
@@ -235,7 +267,9 @@ class regclient(CLIUtil):
                 self.client.sr1_req(
                     OpenClassesRoot_Request(
                         ServerName=None,
-                        samDesired=KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS,
+                        samDesired=KEY_QUERY_VALUE
+                        | KEY_ENUMERATE_SUB_KEYS
+                        | MAX_ALLOWED,
                     ),
                     timeout=10,
                 ).phKey,
@@ -412,9 +446,10 @@ class regclient(CLIUtil):
                 hKey=handle,
                 dwIndex=idx,
                 lpValueNameIn=RPC_UNICODE_STRING(MaximumLength=1024),
-                lpData=b" " * 1024,
-                lpcbData=1024,
-                lpcbLen=1024,
+                lpType=0,  # pointer to type, set to 0 for query
+                lpData=b" " * 1024,  # pointer to buffer
+                lpcbData=1024,  # pointer to buffer size
+                lpcbLen=1024,  # pointer to length
             )
 
             resp = self.client.sr1_req(req)
@@ -446,6 +481,119 @@ class regclient(CLIUtil):
         Joker function to jump into the python code for dev purpose
         """
         breakpoint()
+
+    @CLIUtil.addcommand()
+    def get_key_security(self, folder: Optional[str] = None) -> NoReturn:
+        """
+        Get the security descriptor of the current subkey. SACL are not retrieve at this point (TODO).
+
+        """
+        if self._require_root_handles(silent=True):
+            return
+
+        # If no specific folder was specified
+        # we use our current subkey path
+        if folder is None or folder == "":
+            subkey_path = self.current_subkey_path
+            handle = self.current_subkey_handle
+
+        # Otherwise we use the folder path,
+        # the calling parent shall make sure that this path was properly sanitized
+        else:
+            subkey_path = self._join_path(self.current_subkey_path, folder)
+            handle = self.get_handle_on_subkey(subkey_path)
+            if handle is None:
+                return []
+
+        req = BaseRegGetKeySecurity_Request(
+            hKey=handle,
+            SecurityInformation=0x00000001  # OWNER_SECURITY_INFORMATION
+            | 0x00000002  # GROUP_SECURITY_INFORMATION
+            | 0x00000004,  # DACL_SECURITY_INFORMATION
+            pRpcSecurityDescriptorIn=PRPC_SECURITY_DESCRIPTOR(
+                cbInSecurityDescriptor=512,  # Initial size of the buffer
+            ),
+        )
+
+        resp = self.client.sr1_req(req)
+        if resp.status == ERROR_INSUFFICIENT_BUFFER:
+            # The buffer was too small, we need to retry with a larger one
+            req.pRpcSecurityDescriptorIn.cbInSecurityDescriptor = (
+                resp.pRpcSecurityDescriptorOut.cbInSecurityDescriptor
+            )
+            resp = self.client.sr1_req(req)
+
+        if resp.status:
+            print(f"[-] Error : got status {hex(resp.status)} while getting security")
+            return
+
+        results = resp.pRpcSecurityDescriptorOut.valueof("lpSecurityDescriptor")
+        sd = SECURITY_DESCRIPTOR(results)
+        print("Owner:", sd.OwnerSid.summary())
+        print("Group:", sd.GroupSid.summary())
+        if getattr(sd, "DACL", None):
+            print("DACL:")
+            for ace in sd.DACL.Aces:
+                print(" - ", ace.toSDDL())
+        return sd
+
+    @CLIUtil.addcommand()
+    def query_info(self, folder: Optional[str] = None) -> NoReturn:
+        """
+        Query information on the current subkey
+        """
+        if self._require_root_handles(silent=True):
+            return
+
+        # If no specific folder was specified
+        # we use our current subkey path
+        if folder is None or folder == "":
+            cache = self.ls_cache.get(self.current_subkey_path)
+            subkey_path = self.current_subkey_path
+
+            # if the resolution was already performed,
+            # no need to query again the RPC
+            if cache:
+                return cache
+
+            # The first time we do an ls we need to get
+            # a proper handle
+            if self.current_subkey_handle is None:
+                self.current_subkey_handle = self.get_handle_on_subkey(
+                    PureWindowsPath("")
+                )
+
+            handle = self.current_subkey_handle
+
+        # Otherwise we use the folder path,
+        # the calling parent shall make sure that this path was properly sanitized
+        else:
+            subkey_path = self._join_path(self.current_subkey_path, folder)
+            handle = self.get_handle_on_subkey(subkey_path)
+            if handle is None:
+                return []
+
+        req = BaseRegQueryInfoKey_Request(
+            hKey=handle,
+            lpClassIn=RPC_UNICODE_STRING(),  # pointer to class name
+        )
+
+        resp = self.client.sr1_req(req)
+        if resp.status:
+            print(f"[-] Error : got status {hex(resp.status)} while querying info")
+            return
+
+        print(f"Info on key: {self.current_subkey_path}")
+        print(f"- Number of subkeys: {resp.lpcSubKeys}")
+        print(
+            f"- Length of the longuest subkey name (in bytes): {resp.lpcbMaxSubKeyLen}"
+        )
+        print(f"- Number of values: {resp.lpcValues}")
+        print(
+            f"- Length of the longest value name (in bytes): {resp.lpcbMaxValueNameLen}"
+        )
+        print(f"- Last write time: {from_filetime_to_datetime(resp.lpftLastWriteTime)}")
+        resp.show()
 
     @CLIUtil.addcommand(spaces=True)
     def cd(self, subkey: str) -> NoReturn:
@@ -482,7 +630,9 @@ class regclient(CLIUtil):
         req = BaseRegOpenKey_Request(
             hKey=self.current_root_handle,
             lpSubKey=RPC_UNICODE_STRING(Buffer=subkey_path),
-            samDesired=KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS,
+            samDesired=KEY_QUERY_VALUE
+            | KEY_ENUMERATE_SUB_KEYS
+            | STANDARD_RIGHTS_READ,  # | MAX_ALLOWED,
         )
         resp = self.client.sr1_req(req)
         if resp.status == ERROR_SUBKEY_NOT_FOUND:
