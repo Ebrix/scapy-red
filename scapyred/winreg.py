@@ -2,17 +2,23 @@
 DCE/RPC client
 """
 
-from ctypes.wintypes import PFILETIME
-import re
+from asyncio import timeout
 import socket
 import os
-import pathlib
+
+from ctypes.wintypes import PFILETIME
 from typing import Optional, NoReturn
+from pathlib import PureWindowsPath
 
 from scapy.layers.msrpce.all import *
 from scapy.layers.msrpce.raw.ms_samr import *
 from scapy.layers.msrpce.raw.ms_rrp import *
-from scapy.layers.dcerpc import RPC_C_AUTHN_LEVEL
+from scapy.layers.dcerpc import (
+    RPC_C_AUTHN_LEVEL,
+    NDRConformantArray,
+    NDRPointer,
+    NDRVaryingArray,
+)
 from scapy.utils import (
     CLIUtil,
     pretty_list,
@@ -29,15 +35,12 @@ from scapy.config import conf
 from scapy.themes import DefaultTheme
 from scapy.base_classes import Net
 from scapy.utils6 import Net6
-
 from scapy.layers.msrpce.rpcclient import DCERPC_Client
 from scapy.layers.dcerpc import find_dcerpc_interface, DCERPC_Transport
 from scapy.layers.ntlm import MD4le, NTLMSSP
 from scapy.layers.spnego import SPNEGOSSP
-from scapy.layers.kerberos import KerberosSSP
 from scapy.layers.smb2 import SECURITY_DESCRIPTOR
 
-from pathlib import PureWindowsPath
 
 conf.color_theme = DefaultTheme()
 
@@ -49,6 +52,7 @@ MAX_ALLOWED = 0x02000000
 ERROR_NO_MORE_ITEMS = 0x00000103
 ERROR_SUBKEY_NOT_FOUND = 0x000006F7
 ERROR_INSUFFICIENT_BUFFER = 0x0000007A
+ERROR_MORE_DATA = 0x000000EA
 
 # Predefined keys
 HKEY_CLASSES_ROOT = "HKCROOT"  # Registry entries subordinate to this key define types (or classes) of documents and the properties associated with those types. The subkeys of the HKEY_CLASSES_ROOT key are a merged view of the following two subkeys:
@@ -71,6 +75,17 @@ AVAILABLE_ROOT_KEYS: list[str] = [
     HKEY_PERFORMANCE_NLSTEXT,
 ]
 
+REG_TYPE = {
+    1: "REG_SZ",  # Unicode string
+    2: "REG_EXPAND_SZ",  # Unicode string with environment variable expansion
+    3: "REG_BINARY",  # Binary data
+    4: "REG_DWORD",  # 32-bit unsigned integer
+    5: "REG_DWORD_BIG_ENDIAN",  # 32-bit unsigned integer in big-endian format
+    6: "REG_LINK",  # Symbolic link
+    7: "REG_MULTI_SZ",  # Multiple Unicode strings
+    11: "REG_QWORD",  # 64-bit unsigned integer
+}
+
 
 def from_filetime_to_datetime(lp_filetime: PFILETIME) -> str:
     """
@@ -85,6 +100,62 @@ def from_filetime_to_datetime(lp_filetime: PFILETIME) -> str:
     return datetime.fromtimestamp(seconds, tz=timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
+
+
+class RegEntry:
+    """
+    A registry entry
+    """
+
+    def __init__(self, reg_value: str, reg_type: int, reg_data: bytes):
+        """
+        Initialize the RegEntry
+        :param reg_value: the name of the registry value (str)
+        :param reg_type: the type of the registry value (int)
+        :param reg_data: the data of the registry value (str)
+        """
+        self.reg_value = reg_value
+        self.reg_type = reg_type
+
+        if self.reg_type == 7 or self.reg_type == 1 or self.reg_type == 2:
+            if self.reg_type == 7:
+                # decode multiple null terminated strings
+                self.reg_data = reg_data.decode("utf-16le")[:-2].replace("\x00", "\n")
+            else:
+                # REG_MULTI_SZ, REG_SZ, REG_EXPAND_SZ
+                # Decode the data as a string
+                self.reg_data = reg_data.decode("utf-16le")
+
+        elif self.reg_type == 3:
+            # REG_BINARY
+            # Decode the data as a bytes object
+            self.reg_data = reg_data
+
+        elif self.reg_type == 4 or self.reg_type == 11:
+            # REG_DWORD, REG_QWORD
+            # Decode the data as an integer
+            self.reg_data = int.from_bytes(reg_data, byteorder="little")
+
+        elif self.reg_type == 5:
+            # REG_DWORD_BIG_ENDIAN
+            # Decode the data as an integer in big-endian format
+            self.reg_data = int.from_bytes(reg_data, byteorder="big")
+
+        elif self.reg_type == 6:
+            # REG_LINK
+            # Decode the data as a string (symbolic link)
+            self.reg_data = reg_data.decode("utf-16le")
+
+        else:
+            self.reg_data = reg_data
+
+    def __str__(self) -> str:
+        return (
+            f"{self.reg_value} ({REG_TYPE.get(self.reg_type, "UNK")}) {self.reg_data} "
+        )
+
+    def __repr__(self) -> str:
+        return f"RegEntry(reg_value={self.reg_value}, reg_type={self.reg_type}, reg_data={self.reg_data})"
 
 
 @conf.commands.register
@@ -221,7 +292,7 @@ class regclient(CLIUtil):
         self.root_handle = {}
         self.current_root_handle = None
         self.current_subkey_handle = None
-        self.current_subkey_path: PureWindowsPath = pathlib.PureWindowsPath("")
+        self.current_subkey_path: PureWindowsPath = PureWindowsPath("")
         if rootKey in AVAILABLE_ROOT_KEYS:
             self.current_root_path = rootKey.strip()
             self.use(self.current_root_path)
@@ -411,7 +482,7 @@ class regclient(CLIUtil):
         ]
 
     @CLIUtil.addcommand(spaces=True)
-    def cat(self, folder: Optional[str] = None) -> list[str]:
+    def cat(self, folder: Optional[str] = None) -> list[tuple[str, str]]:
         # If no specific folder was specified
         # we use our current subkey path
         if folder is None or folder == "":
@@ -441,15 +512,23 @@ class regclient(CLIUtil):
                 return []
 
         idx = 0
+        results = []
         while True:
             req = BaseRegEnumValue_Request(
                 hKey=handle,
                 dwIndex=idx,
-                lpValueNameIn=RPC_UNICODE_STRING(MaximumLength=1024),
+                lpValueNameIn=RPC_UNICODE_STRING(
+                    MaximumLength=2048,
+                    Buffer=NDRPointer(
+                        value=NDRConformantArray(
+                            max_count=1024, value=NDRVaryingArray(value=b"")
+                        )
+                    ),
+                ),
                 lpType=0,  # pointer to type, set to 0 for query
-                lpData=b" " * 1024,  # pointer to buffer
-                lpcbData=1024,  # pointer to buffer size
-                lpcbLen=1024,  # pointer to length
+                lpData=None,  # pointer to buffer
+                lpcbData=0,  # pointer to buffer size
+                lpcbLen=0,  # pointer to length
             )
 
             resp = self.client.sr1_req(req)
@@ -459,15 +538,68 @@ class regclient(CLIUtil):
                 print(
                     f"[-] Error : got status {hex(resp.status)} while enumerating values"
                 )
-                breakpoint()
                 self.cat_cache.clear()
                 return []
+            # resp.show()
 
-            breakpoint()
-            self.ls_cache[subkey_path].append(
-                resp.lpNameOut.valueof("Buffer").decode("utf-8").strip("\x00")
+            req = BaseRegQueryValue_Request(
+                hKey=handle,
+                lpValueName=resp.valueof("lpValueNameOut"),
+                lpType=0,
+                lpcbData=1024,
+                lpcbLen=0,
+                lpData=NDRPointer(
+                    value=NDRConformantArray(
+                        max_count=1024, value=NDRVaryingArray(actual_count=0, value=b"")
+                    )
+                ),
             )
+            # req.show()
+            resp2 = self.client.sr1_req(req)
+            if resp2.status == ERROR_MORE_DATA:
+                # The buffer was too small, we need to retry with a larger one
+                req.lpcbData = resp2.lpcbData
+                req.lpData.value.max_count = resp2.lpcbData.value
+                return results
+                resp2 = self.client.sr1_req(req, timeout=1)
+
+            if resp2.status:
+                print(
+                    f"[-] Error : got status {hex(resp2.status)} while querying value"
+                )
+                return []
+
+            value = (
+                resp.valueof("lpValueNameOut").valueof("Buffer").decode("utf-8").strip()
+            )
+            results.append(
+                RegEntry(
+                    reg_value=value,
+                    reg_type=resp2.valueof("lpType"),
+                    reg_data=resp2.valueof("lpData"),
+                )
+            )
+
+            # self.cat_cache[subkey_path].append(
+            #     resp.valueof("lpValueNameOut").valueof("Buffer").decode("utf-8").strip()
+            # )
             idx += 1
+
+        return results
+
+    @CLIUtil.addoutput(cat)
+    def cat_output(self, results: list[RegEntry]) -> NoReturn:
+        """
+        Print the output of 'cat'
+        """
+        if not results or len(results) == 0:
+            print("No values found.")
+            return
+
+        for entry in results:
+            print(
+                f"  - {entry.reg_value:<20} {'(' + REG_TYPE.get(entry.reg_type, "UNK") + ')':<15} {entry.reg_data}"
+            )
 
     def _require_root_handles(self, silent: bool = False) -> bool:
         if self.current_root_handle is None:
@@ -593,7 +725,6 @@ class regclient(CLIUtil):
             f"- Length of the longest value name (in bytes): {resp.lpcbMaxValueNameLen}"
         )
         print(f"- Last write time: {from_filetime_to_datetime(resp.lpftLastWriteTime)}")
-        resp.show()
 
     @CLIUtil.addcommand(spaces=True)
     def cd(self, subkey: str) -> NoReturn:
