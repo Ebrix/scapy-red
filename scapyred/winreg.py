@@ -560,8 +560,7 @@ class regclient(CLIUtil):
                 # The buffer was too small, we need to retry with a larger one
                 req.lpcbData = resp2.lpcbData
                 req.lpData.value.max_count = resp2.lpcbData.value
-                return results
-                resp2 = self.client.sr1_req(req, timeout=1)
+                resp2 = self.client.sr1_req(req)
 
             if resp2.status:
                 print(
