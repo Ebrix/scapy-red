@@ -2,17 +2,37 @@
 DCE/RPC client
 """
 
-from asyncio import timeout
 import socket
 import os
+import logging
+
+from enum import IntEnum, IntFlag, StrEnum
 
 from ctypes.wintypes import PFILETIME
 from typing import Optional, NoReturn
 from pathlib import PureWindowsPath
 
-from scapy.layers.msrpce.all import *
-from scapy.layers.msrpce.raw.ms_samr import *
-from scapy.layers.msrpce.raw.ms_rrp import *
+# pylint: disable-next=import-error, no-name-in-module
+from scapy.layers.msrpce.raw.ms_rrp import (
+    OpenClassesRoot_Request,
+    OpenLocalMachine_Request,
+    OpenCurrentUser_Request,
+    OpenUsers_Request,
+    OpenCurrentConfig_Request,
+    OpenPerformanceData_Request,
+    OpenPerformanceText_Request,
+    OpenPerformanceNlsText_Request,
+    BaseRegOpenKey_Request,
+    BaseRegEnumKey_Request,
+    BaseRegEnumValue_Request,
+    BaseRegQueryValue_Request,
+    BaseRegGetVersion_Request,
+    BaseRegQueryInfoKey_Request,
+    BaseRegGetKeySecurity_Request,
+    PRPC_SECURITY_DESCRIPTOR,
+    NDRContextHandle,
+    RPC_UNICODE_STRING,
+)
 from scapy.layers.dcerpc import (
     RPC_C_AUTHN_LEVEL,
     NDRConformantArray,
@@ -21,8 +41,6 @@ from scapy.layers.dcerpc import (
 )
 from scapy.utils import (
     CLIUtil,
-    pretty_list,
-    human_size,
     valid_ip,
     valid_ip6,
 )
@@ -43,48 +61,131 @@ from scapy.layers.smb2 import SECURITY_DESCRIPTOR
 
 
 conf.color_theme = DefaultTheme()
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s][%(funcName)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    filename="winreg.log",  # write logs here
+    filemode="w",
+)
+logger = logging.getLogger(__name__)
 
 
-KEY_QUERY_VALUE = 0x00000001
-KEY_ENUMERATE_SUB_KEYS = 0x00000008
-STANDARD_RIGHTS_READ = 0x00020000  # Standard rights for read access
-MAX_ALLOWED = 0x02000000
-ERROR_NO_MORE_ITEMS = 0x00000103
-ERROR_SUBKEY_NOT_FOUND = 0x000006F7
-ERROR_INSUFFICIENT_BUFFER = 0x0000007A
-ERROR_MORE_DATA = 0x000000EA
+class AccessRights(IntFlag):
+    """
+    Access rights for registry keys
+    """
 
-# Predefined keys
-HKEY_CLASSES_ROOT = "HKCROOT"  # Registry entries subordinate to this key define types (or classes) of documents and the properties associated with those types. The subkeys of the HKEY_CLASSES_ROOT key are a merged view of the following two subkeys:
-HKEY_CURRENT_USER = "HKCU"  # Registry entries subordinate to this key define the preferences of the current user. These preferences include the settings of environment variables, data on program groups, colors, printers, network connections, and application preferences. The HKEY_CURRENT_USER root key is a subkey of the HKEY_USERS root key, as described in section 3.1.1.8.
-HKEY_LOCAL_MACHINE = "HKLM"  # Registry entries subordinate to this key define the physical state of the computer, including data on the bus type, system memory, and installed hardware and software.
-HKEY_CURRENT_CONFIG = "HKC"  # This key contains information on the current hardware profile of the local computer. HKEY_CURRENT_CONFIG is an alias for HKEY_LOCAL_MACHINE\System\CurrentControlSet\Hardware Profiles\Current
-HKEY_USERS = "HKU"
-HKEY_PERFORMANCE_DATA = "HKPERFORMANCE"  # Registry entries subordinate to this key allow access to performance data.
-HKEY_PERFORMANCE_TEXT = ""  # Registry entries subordinate to this key reference the text strings that describe counters in U.S. English.
-HKEY_PERFORMANCE_NLSTEXT = ""  # Registry entries subordinate to this key reference the text strings that describe counters in the local language of the area in which the computer is running.
+    # Access rights for registry keys
+    # These constants are used to specify the access rights when opening or creating registry keys.
+    KEY_QUERY_VALUE = 0x00000001
+    KEY_ENUMERATE_SUB_KEYS = 0x00000008
+    STANDARD_RIGHTS_READ = 0x00020000
+    MAX_ALLOWED = 0x02000000
 
-AVAILABLE_ROOT_KEYS: list[str] = [
-    HKEY_LOCAL_MACHINE,
-    HKEY_CURRENT_USER,
-    HKEY_USERS,
-    HKEY_CLASSES_ROOT,
-    HKEY_CURRENT_CONFIG,
-    HKEY_PERFORMANCE_DATA,
-    HKEY_PERFORMANCE_TEXT,
-    HKEY_PERFORMANCE_NLSTEXT,
-]
 
-REG_TYPE = {
-    1: "REG_SZ",  # Unicode string
-    2: "REG_EXPAND_SZ",  # Unicode string with environment variable expansion
-    3: "REG_BINARY",  # Binary data
-    4: "REG_DWORD",  # 32-bit unsigned integer
-    5: "REG_DWORD_BIG_ENDIAN",  # 32-bit unsigned integer in big-endian format
-    6: "REG_LINK",  # Symbolic link
-    7: "REG_MULTI_SZ",  # Multiple Unicode strings
-    11: "REG_QWORD",  # 64-bit unsigned integer
-}
+class ErrorCodes(IntEnum):
+    """
+    Error codes for registry operations
+    """
+
+    ERROR_SUCCESS = 0x00000000
+    ERROR_ACCESS_DENIED = 0x00000005
+    ERROR_FILE_NOT_FOUND = 0x00000002
+    ERROR_INVALID_HANDLE = 0x00000006
+    ERROR_NOT_SAME_DEVICE = 0x00000011
+    ERROR_WRITE_PROTECT = 0x00000013
+    ERROR_INVALID_PARAMETER = 0x00000057
+    ERROR_CALL_NOT_IMPLEMENTED = 0x00000057
+    ERROR_NO_MORE_ITEMS = 0x00000103
+    ERROR_NOACCESS = 0x000003E6
+    ERROR_SUBKEY_NOT_FOUND = 0x000006F7
+    ERROR_INSUFFICIENT_BUFFER = 0x0000007A
+    ERROR_MORE_DATA = 0x000000EA
+
+    def __str__(self) -> str:
+        """
+        Return the string representation of the error code.
+        :return: The string representation of the error code.
+        """
+        return self.name
+
+
+class RootKeys(StrEnum):
+    """
+    Root keys for the Windows registry
+    """
+
+    # Registry root keys
+    # These constants are used to specify the root keys of the Windows registry.
+    # The root keys are the top-level keys in the registry hierarchy.
+
+    # Registry entries subordinate to this key define types (or classes) of documents and the
+    # properties associated with those types.
+    # The subkeys of the HKEY_CLASSES_ROOT key are a merged view of the following two subkeys:
+    HKEY_CLASSES_ROOT = "HKCROOT"
+
+    # Registry entries subordinate to this key define the preferences of the current user.
+    # These preferences include the settings of environment variables, data on program groups,
+    # colors, printers, network connections, and application preferences.
+    # The HKEY_CURRENT_USER root key is a subkey of the HKEY_USERS root key, as described in
+    # section 3.1.1.8.
+    HKEY_CURRENT_USER = "HKCU"
+
+    # Registry entries subordinate to this key define the physical state of the computer,
+    # including data on the bus type, system memory, and installed hardware and software.
+    HKEY_LOCAL_MACHINE = "HKLM"
+
+    # This key contains information on the current hardware profile of the local computer.
+    # HKEY_CURRENT_CONFIG is an alias for
+    # HKEY_LOCAL_MACHINE\System\CurrentControlSet\Hardware Profiles\Current
+    HKEY_CURRENT_CONFIG = "HKC"
+
+    # This key define the default user configuration for new users on the local computer and the
+    # user configuration for the current user.
+    HKEY_USERS = "HKU"
+
+    # Registry entries subordinate to this key allow access to performance data.
+    HKEY_PERFORMANCE_DATA = "HKPERFDATA"
+
+    # Registry entries subordinate to this key reference the text strings that describe counters
+    # in U.S. English.
+    HKEY_PERFORMANCE_TEXT = "HKPERFTXT"
+
+    # Registry entries subordinate to this key reference the text strings that describe
+    # counters in the local language of the area in which the computer is running.
+    HKEY_PERFORMANCE_NLSTEXT = "HKPERFNLSTXT"
+
+    def __new__(cls, value):
+        # 1. Strip and uppercase the raw input
+        normalized = value.strip().upper()
+        # 2. Create the enum member with the normalized value
+        obj = str.__new__(cls, normalized)
+        obj._value_ = normalized
+        return obj
+
+
+class RegType(IntEnum):
+    """
+    Registry value types
+    """
+
+    # Registry value types
+    # These constants are used to specify the type of a registry value.
+    REG_SZ = 1  # Unicode string
+    REG_EXPAND_SZ = 2  # Unicode string with environment variable expansion
+    REG_BINARY = 3  # Binary data
+    REG_DWORD = 4  # 32-bit unsigned integer
+    REG_DWORD_BIG_ENDIAN = 5  # 32-bit unsigned integer in big-endian format
+    REG_LINK = 6  # Symbolic link
+    REG_MULTI_SZ = 7  # Multiple Unicode strings
+    REG_QWORD = 11  # 64-bit unsigned integer
+    UNK = 99999  # fallback default
+
+    @classmethod
+    def _missing_(cls, value):
+        print(f"Unknown registry type: {value}, using UNK")
+        return cls.UNK
 
 
 def from_filetime_to_datetime(lp_filetime: PFILETIME) -> str:
@@ -102,64 +203,91 @@ def from_filetime_to_datetime(lp_filetime: PFILETIME) -> str:
     )
 
 
+def is_status_ok(status: int) -> bool:
+    """
+    Check the error code and raise an exception if it is not successful.
+    :param status: The error code to check.
+    """
+    try:
+        err = ErrorCodes(status)
+        if err not in [
+            ErrorCodes.ERROR_SUCCESS,
+            ErrorCodes.ERROR_NO_MORE_ITEMS,
+            ErrorCodes.ERROR_MORE_DATA,
+        ]:
+            print(f"[!] Error: {hex(err.value)} - {ErrorCodes(status).name}")
+            breakpoint()
+            return False
+        return True
+    except ValueError as exc:
+        print(f"[!] Error: {hex(status)} - Unknown error code")
+        breakpoint()
+        raise ValueError(f"Error: {hex(status)} - Unknown error code") from exc
+
+
+AVAILABLE_ROOT_KEYS: list[str] = [
+    RootKeys.HKEY_LOCAL_MACHINE,
+    RootKeys.HKEY_CURRENT_USER,
+    RootKeys.HKEY_USERS,
+    RootKeys.HKEY_CLASSES_ROOT,
+    RootKeys.HKEY_CURRENT_CONFIG,
+    RootKeys.HKEY_PERFORMANCE_DATA,
+    RootKeys.HKEY_PERFORMANCE_TEXT,
+    RootKeys.HKEY_PERFORMANCE_NLSTEXT,
+]
+
+
 class RegEntry:
     """
-    A registry entry
-    """
+    RegEntry to properly parse the data based on the type.
 
-    def __init__(self, reg_value: str, reg_type: int, reg_data: bytes):
-        """
-        Initialize the RegEntry
         :param reg_value: the name of the registry value (str)
         :param reg_type: the type of the registry value (int)
         :param reg_data: the data of the registry value (str)
-        """
-        self.reg_value = reg_value
-        self.reg_type = reg_type
+    """
 
-        if self.reg_type == 7 or self.reg_type == 1 or self.reg_type == 2:
-            if self.reg_type == 7:
+    def __init__(self, reg_value: str, reg_type: int, reg_data: bytes):
+        self.reg_value = reg_value
+        try:
+            self.reg_type = RegType(reg_type)
+        except ValueError:
+            self.reg_type = RegType.UNK
+
+        if (
+            self.reg_type == RegType.REG_MULTI_SZ
+            or self.reg_type == RegType.REG_SZ
+            or self.reg_type == RegType.REG_EXPAND_SZ
+        ):
+            if self.reg_type == RegType.REG_MULTI_SZ:
                 # decode multiple null terminated strings
                 self.reg_data = reg_data.decode("utf-16le")[:-2].replace("\x00", "\n")
             else:
-                # REG_MULTI_SZ, REG_SZ, REG_EXPAND_SZ
-                # Decode the data as a string
                 self.reg_data = reg_data.decode("utf-16le")
 
-        elif self.reg_type == 3:
-            # REG_BINARY
-            # Decode the data as a bytes object
+        elif self.reg_type == RegType.REG_BINARY:
             self.reg_data = reg_data
 
-        elif self.reg_type == 4 or self.reg_type == 11:
-            # REG_DWORD, REG_QWORD
-            # Decode the data as an integer
+        elif self.reg_type == RegType.REG_DWORD or self.reg_type == RegType.REG_QWORD:
             self.reg_data = int.from_bytes(reg_data, byteorder="little")
 
-        elif self.reg_type == 5:
-            # REG_DWORD_BIG_ENDIAN
-            # Decode the data as an integer in big-endian format
+        elif self.reg_type == RegType.REG_DWORD_BIG_ENDIAN:
             self.reg_data = int.from_bytes(reg_data, byteorder="big")
 
-        elif self.reg_type == 6:
-            # REG_LINK
-            # Decode the data as a string (symbolic link)
+        elif self.reg_type == RegType.REG_LINK:
             self.reg_data = reg_data.decode("utf-16le")
 
         else:
             self.reg_data = reg_data
 
     def __str__(self) -> str:
-        return (
-            f"{self.reg_value} ({REG_TYPE.get(self.reg_type, "UNK")}) {self.reg_data} "
-        )
+        return f"{self.reg_value} ({self.reg_type.name}) {self.reg_data}"
 
     def __repr__(self) -> str:
-        return f"RegEntry(reg_value={self.reg_value}, reg_type={self.reg_type}, reg_data={self.reg_data})"
+        return f"RegEntry({self.reg_value}, {self.reg_type}, {self.reg_data})"
 
 
 @conf.commands.register
-class regclient(CLIUtil):
+class RegClient(CLIUtil):
     r"""
     A simple registry CLI
 
@@ -282,7 +410,19 @@ class regclient(CLIUtil):
             ssp=ssp,
             ndr64=False,
         )
+        if debug:
+            logger.setLevel(logging.DEBUG)
+            logger.debug(
+                "Connecting to %s:%d with UPN=%s, guest=%s, kerberos=%s, kerberos_required=%s",
+                target,
+                port,
+                UPN,
+                guest,
+                kerberos,
+                kerberos_required,
+            )
 
+        self.timeout = timeout
         self.client.verb = False
         self.client.connect(target)
         self.client.open_smbpipe("winreg")
@@ -313,6 +453,10 @@ class regclient(CLIUtil):
         print("Connection closed")
         self.client.close()
 
+    # --------------------------------------------- #
+    #                   Use Root Key
+    # --------------------------------------------- #
+
     @CLIUtil.addcommand()
     def use(self, root_path):
         """
@@ -331,50 +475,124 @@ class regclient(CLIUtil):
             - Clears the local subkey cache (`self.ls_cache`).
             - Changes the current directory to the root of the selected registry hive.
         """
-        if root_path.upper().startswith(HKEY_CLASSES_ROOT):
-            # Change to HKLM root
-            self.current_root_handle = self.root_handle.setdefault(
-                HKEY_CLASSES_ROOT,
-                self.client.sr1_req(
-                    OpenClassesRoot_Request(
-                        ServerName=None,
-                        samDesired=KEY_QUERY_VALUE
-                        | KEY_ENUMERATE_SUB_KEYS
-                        | MAX_ALLOWED,
-                    ),
-                    timeout=10,
-                ).phKey,
-            )
-            self.current_root_path = HKEY_CLASSES_ROOT
 
-        if root_path.upper().startswith(HKEY_LOCAL_MACHINE):
-            # Change to HKLM root
-            self.current_root_handle = self.root_handle.setdefault(
-                HKEY_LOCAL_MACHINE,
-                self.client.sr1_req(
-                    OpenLocalMachine_Request(
-                        ServerName=None,
-                        samDesired=KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS,
-                    ),
-                    timeout=6,
-                ).phKey,
-            )
-            self.current_root_path = HKEY_LOCAL_MACHINE
+        default_read_access_rights = (
+            AccessRights.KEY_QUERY_VALUE
+            | AccessRights.KEY_ENUMERATE_SUB_KEYS
+            | AccessRights.STANDARD_RIGHTS_READ
+        )
+        root_path = RootKeys(root_path)
 
-        if root_path.upper().startswith(HKEY_CURRENT_USER):
-            # Change to HKLM root
-            self.current_root_handle = self.root_handle.setdefault(
-                HKEY_CURRENT_USER,
-                self.client.sr1_req(
-                    OpenCurrentUser_Request(
-                        ServerName=None,
-                        samDesired=KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS,
-                    ),
-                    timeout=4,
-                ).phKey,
-            )
-            self.current_root_path = HKEY_CURRENT_USER
+        match root_path:
+            case RootKeys.HKEY_CLASSES_ROOT:
+                # Change to HKCR root
+                self.current_root_handle = self.root_handle.setdefault(
+                    RootKeys.HKEY_CLASSES_ROOT.value,
+                    self.client.sr1_req(
+                        OpenClassesRoot_Request(
+                            ServerName=None, samDesired=default_read_access_rights
+                        ),
+                        timeout=self.timeout,
+                    ).phKey,
+                )
 
+            case RootKeys.HKEY_CURRENT_USER:
+                # Change to HKCU root
+                self.current_root_handle = self.root_handle.setdefault(
+                    RootKeys.HKEY_CURRENT_USER.value,
+                    self.client.sr1_req(
+                        OpenCurrentUser_Request(
+                            ServerName=None,
+                            samDesired=default_read_access_rights,
+                        ),
+                        timeout=self.timeout,
+                    ).phKey,
+                )
+
+            case RootKeys.HKEY_LOCAL_MACHINE:
+                # Change to HKLM root
+                self.current_root_handle = self.root_handle.setdefault(
+                    RootKeys.HKEY_LOCAL_MACHINE.value,
+                    self.client.sr1_req(
+                        OpenLocalMachine_Request(
+                            ServerName=None,
+                            samDesired=default_read_access_rights,
+                        ),
+                        timeout=self.timeout,
+                    ).phKey,
+                )
+
+            case RootKeys.HKEY_CURRENT_CONFIG:
+                # Change to HKCU root
+                self.current_root_handle = self.root_handle.setdefault(
+                    RootKeys.HKEY_CURRENT_CONFIG.value,
+                    self.client.sr1_req(
+                        OpenCurrentConfig_Request(
+                            ServerName=None,
+                            samDesired=default_read_access_rights,
+                        ),
+                        timeout=self.timeout,
+                    ).phKey,
+                )
+
+            case RootKeys.HKEY_USERS:
+                self.current_root_handle = self.root_handle.setdefault(
+                    RootKeys.HKEY_USERS.value,
+                    self.client.sr1_req(
+                        OpenUsers_Request(
+                            ServerName=None,
+                            samDesired=default_read_access_rights,
+                        ),
+                        timeout=self.timeout,
+                    ).phKey,
+                )
+
+            case RootKeys.HKEY_PERFORMANCE_DATA:
+                self.current_root_handle = self.root_handle.setdefault(
+                    RootKeys.HKEY_PERFORMANCE_DATA.value,
+                    self.client.sr1_req(
+                        OpenPerformanceData_Request(
+                            ServerName=None,
+                            samDesired=default_read_access_rights,
+                        ),
+                        timeout=self.timeout,
+                    ).phKey,
+                )
+
+            case RootKeys.HKEY_PERFORMANCE_TEXT:
+                self.current_root_handle = self.root_handle.setdefault(
+                    RootKeys.HKEY_PERFORMANCE_TEXT.value,
+                    self.client.sr1_req(
+                        OpenPerformanceText_Request(
+                            ServerName=None,
+                            samDesired=default_read_access_rights,
+                        ),
+                        timeout=self.timeout,
+                    ).phKey,
+                )
+
+            case RootKeys.HKEY_PERFORMANCE_NLSTEXT:
+                self.current_root_handle = self.root_handle.setdefault(
+                    RootKeys.HKEY_PERFORMANCE_NLSTEXT.value,
+                    self.client.sr1_req(
+                        OpenPerformanceNlsText_Request(
+                            ServerName=None,
+                            samDesired=default_read_access_rights,
+                        ),
+                        timeout=self.timeout,
+                    ).phKey,
+                )
+
+            case _:
+                # If the root key is not recognized, raise an error
+                print(f"Unknown root key: {root_path}")
+                self.ls_cache.clear()
+                self.current_root_handle = None
+                self.current_root_path = "CHOOSE ROOT KEY"
+                self.cd("")
+                return
+
+        self.current_root_path = root_path.value
         self.ls_cache.clear()
         self.cd("")
 
@@ -389,16 +607,9 @@ class regclient(CLIUtil):
             if str(rkey).lower().startswith(root_key.lower())
         ]
 
-    @CLIUtil.addcommand()
-    def version(self):
-        """
-        Get remote registry server version
-        """
-        version = self.client.sr1_req(
-            BaseRegGetVersion_Request(hKey=self.current_root_handle)
-        ).lpdwVersion
-        print(f"Remote registry server version: {version}")
-
+    # --------------------------------------------- #
+    #                   List and Cat
+    # --------------------------------------------- #
     @CLIUtil.addcommand(spaces=True)
     def ls(self, folder: Optional[str] = None) -> list[str]:
         """
@@ -444,9 +655,9 @@ class regclient(CLIUtil):
             )
 
             resp = self.client.sr1_req(req)
-            if resp.status == ERROR_NO_MORE_ITEMS:
+            if resp.status == ErrorCodes.ERROR_NO_MORE_ITEMS:
                 break
-            elif resp.status:
+            elif not is_status_ok(resp.status):
                 print(
                     f"[-] Error : got status {hex(resp.status)} while enumerating keys"
                 )
@@ -483,6 +694,23 @@ class regclient(CLIUtil):
 
     @CLIUtil.addcommand(spaces=True)
     def cat(self, folder: Optional[str] = None) -> list[tuple[str, str]]:
+        """
+        Enumerates and retrieves registry values for a given subkey path.
+
+        If no folder is specified, uses the current subkey path and caches results to avoid redundant RPC queries.
+        Otherwise, enumerates values under the specified folder path.
+
+        Args:
+            folder (Optional[str]): The subkey path to enumerate. If None or empty, uses the current subkey path.
+
+        Returns:
+            list[tuple[str, str]]: A list of registry entries (as RegEntry objects) for the specified subkey path.
+                                   Returns an empty list if the handle is invalid or an error occurs during enumeration.
+
+        Side Effects:
+            - May print error messages to standard output if RPC queries fail.
+            - Updates internal cache for previously enumerated subkey paths.
+        """
         # If no specific folder was specified
         # we use our current subkey path
         if folder is None or folder == "":
@@ -532,15 +760,14 @@ class regclient(CLIUtil):
             )
 
             resp = self.client.sr1_req(req)
-            if resp.status == ERROR_NO_MORE_ITEMS:
+            if resp.status == ErrorCodes.ERROR_NO_MORE_ITEMS:
                 break
-            elif resp.status:
+            elif not is_status_ok(resp.status):
                 print(
                     f"[-] Error : got status {hex(resp.status)} while enumerating values"
                 )
                 self.cat_cache.clear()
                 return []
-            # resp.show()
 
             req = BaseRegQueryValue_Request(
                 hKey=handle,
@@ -554,14 +781,22 @@ class regclient(CLIUtil):
                     )
                 ),
             )
-            # req.show()
+
             resp2 = self.client.sr1_req(req)
-            if resp2.status == ERROR_MORE_DATA:
+            if resp2.status == ErrorCodes.ERROR_MORE_DATA:
                 # The buffer was too small, we need to retry with a larger one
                 req.lpcbData = resp2.lpcbData
                 req.lpData.value.max_count = resp2.lpcbData.value
+<<<<<<< HEAD
                 return results
                 resp2 = self.client.sr1_req(req, timeout=1)
+=======
+<<<<<<< HEAD
+                resp2 = self.client.sr1_req(req)
+=======
+                return results
+>>>>>>> 886efa0 (Clean up and some reorganisation)
+>>>>>>> 1e91a3c (Clean up and some reorganisation)
 
             if resp2.status:
                 print(
@@ -588,7 +823,7 @@ class regclient(CLIUtil):
         return results
 
     @CLIUtil.addoutput(cat)
-    def cat_output(self, results: list[RegEntry]) -> NoReturn:
+    def cat_output(self, results: list[RegEntry]) -> None:
         """
         Print the output of 'cat'
         """
@@ -598,24 +833,51 @@ class regclient(CLIUtil):
 
         for entry in results:
             print(
-                f"  - {entry.reg_value:<20} {'(' + REG_TYPE.get(entry.reg_type, "UNK") + ')':<15} {entry.reg_data}"
+                f"  - {entry.reg_value:<20} {'(' + entry.reg_type.name + ')':<15} {entry.reg_data}"
             )
 
-    def _require_root_handles(self, silent: bool = False) -> bool:
-        if self.current_root_handle is None:
-            if not silent:
-                print("No root key selected ! Use 'use' to use one.")
-            return True
+    # --------------------------------------------- #
+    #                   Change Directory
+    # --------------------------------------------- #
+
+    @CLIUtil.addcommand(spaces=True)
+    def cd(self, subkey: str) -> None:
+        """
+        Change current subkey path
+        """
+        if subkey.strip() == "":
+            # If the subkey is ".", we do not change the current subkey path
+            tmp_path = PureWindowsPath()
+        else:
+            tmp_path = self._join_path(self.current_subkey_path, subkey)
+
+        tmp_handle = self.get_handle_on_subkey(tmp_path)
+
+        if tmp_handle is not None:
+            # If the handle was successfully retrieved,
+            # we update the current subkey path and handle
+            self.current_subkey_path = tmp_path
+            self.current_subkey_handle = tmp_handle
+
+    @CLIUtil.addcomplete(cd)
+    def cd_complete(self, folder: str) -> list[str]:
+        """
+        Auto-complete cd
+        """
+        if self._require_root_handles(silent=True):
+            return []
+        return [
+            str(subk)
+            for subk in self.ls()
+            if str(subk).lower().startswith(folder.lower())
+        ]
+
+    # --------------------------------------------- #
+    #                   Get Information
+    # --------------------------------------------- #
 
     @CLIUtil.addcommand()
-    def dev(self) -> NoReturn:
-        """
-        Joker function to jump into the python code for dev purpose
-        """
-        breakpoint()
-
-    @CLIUtil.addcommand()
-    def get_key_security(self, folder: Optional[str] = None) -> NoReturn:
+    def get_sd(self, folder: Optional[str] = None) -> Optional[SECURITY_DESCRIPTOR]:
         """
         Get the security descriptor of the current subkey. SACL are not retrieve at this point (TODO).
 
@@ -635,7 +897,7 @@ class regclient(CLIUtil):
             subkey_path = self._join_path(self.current_subkey_path, folder)
             handle = self.get_handle_on_subkey(subkey_path)
             if handle is None:
-                return []
+                return None
 
         req = BaseRegGetKeySecurity_Request(
             hKey=handle,
@@ -648,16 +910,16 @@ class regclient(CLIUtil):
         )
 
         resp = self.client.sr1_req(req)
-        if resp.status == ERROR_INSUFFICIENT_BUFFER:
+        if resp.status == ErrorCodes.ERROR_INSUFFICIENT_BUFFER:
             # The buffer was too small, we need to retry with a larger one
             req.pRpcSecurityDescriptorIn.cbInSecurityDescriptor = (
                 resp.pRpcSecurityDescriptorOut.cbInSecurityDescriptor
             )
             resp = self.client.sr1_req(req)
 
-        if resp.status:
+        if not is_status_ok(resp.status):
             print(f"[-] Error : got status {hex(resp.status)} while getting security")
-            return
+            return None
 
         results = resp.pRpcSecurityDescriptorOut.valueof("lpSecurityDescriptor")
         sd = SECURITY_DESCRIPTOR(results)
@@ -670,40 +932,14 @@ class regclient(CLIUtil):
         return sd
 
     @CLIUtil.addcommand()
-    def query_info(self, folder: Optional[str] = None) -> NoReturn:
+    def query_info(self, folder: Optional[str] = None) -> None:
         """
         Query information on the current subkey
         """
-        if self._require_root_handles(silent=True):
-            return
-
-        # If no specific folder was specified
-        # we use our current subkey path
-        if folder is None or folder == "":
-            cache = self.ls_cache.get(self.current_subkey_path)
-            subkey_path = self.current_subkey_path
-
-            # if the resolution was already performed,
-            # no need to query again the RPC
-            if cache:
-                return cache
-
-            # The first time we do an ls we need to get
-            # a proper handle
-            if self.current_subkey_handle is None:
-                self.current_subkey_handle = self.get_handle_on_subkey(
-                    PureWindowsPath("")
-                )
-
-            handle = self.current_subkey_handle
-
-        # Otherwise we use the folder path,
-        # the calling parent shall make sure that this path was properly sanitized
-        else:
-            subkey_path = self._join_path(self.current_subkey_path, folder)
-            handle = self.get_handle_on_subkey(subkey_path)
-            if handle is None:
-                return []
+        handle = self._get_handle(folder)
+        if handle is None:
+            logger.error("Could not get handle on the specified subkey.")
+            return None
 
         req = BaseRegQueryInfoKey_Request(
             hKey=handle,
@@ -711,66 +947,108 @@ class regclient(CLIUtil):
         )
 
         resp = self.client.sr1_req(req)
-        if resp.status:
-            print(f"[-] Error : got status {hex(resp.status)} while querying info")
-            return
+        if not is_status_ok(resp.status):
+            logger.error("Got status %s while querying info", hex(resp.status))
+            return None
 
-        print(f"Info on key: {self.current_subkey_path}")
-        print(f"- Number of subkeys: {resp.lpcSubKeys}")
         print(
-            f"- Length of the longuest subkey name (in bytes): {resp.lpcbMaxSubKeyLen}"
+            f"""
+Info on key: {self.current_subkey_path}
+  - Number of subkeys: {resp.lpcSubKeys}
+  - Length of the longuest subkey name (in bytes): {resp.lpcbMaxSubKeyLen}
+  - Number of values: {resp.lpcValues}
+  - Length of the longest value name (in bytes): {resp.lpcbMaxValueNameLen}
+  - Last write time: {from_filetime_to_datetime(resp.lpftLastWriteTime)}
+"""
         )
-        print(f"- Number of values: {resp.lpcValues}")
-        print(
-            f"- Length of the longest value name (in bytes): {resp.lpcbMaxValueNameLen}"
-        )
-        print(f"- Last write time: {from_filetime_to_datetime(resp.lpftLastWriteTime)}")
 
-    @CLIUtil.addcommand(spaces=True)
-    def cd(self, subkey: str) -> NoReturn:
+    @CLIUtil.addcommand()
+    def version(self):
         """
-        Change current subkey path
+        Get remote registry server version
         """
-        self.current_subkey_path = self._join_path(self.current_subkey_path, subkey)
-        self.current_subkey_handle = self.get_handle_on_subkey(self.current_subkey_path)
-        self.ls_cache.clear()
+        version = self.client.sr1_req(
+            BaseRegGetVersion_Request(hKey=self.current_root_handle)
+        ).lpdwVersion
+        print(f"Remote registry server version: {version}")
 
-    @CLIUtil.addcomplete(cd)
-    def cd_complete(self, folder: str) -> list[str]:
-        """
-        Auto-complete cd
-        """
-        if self._require_root_handles(silent=True):
-            return []
-        return [
-            str(subk)
-            for subk in self.ls()
-            if str(subk).lower().startswith(folder.lower())
-        ]
+    # --------------------------------------------- #
+    #                   Utils
+    # --------------------------------------------- #
 
-    def get_handle_on_subkey(self, subkey_path: PureWindowsPath) -> NDRContextHandle:
+    def get_handle_on_subkey(
+        self,
+        subkey_path: PureWindowsPath,
+        desired_access_rights: Optional[IntFlag] = None,
+    ) -> Optional[NDRContextHandle]:
         """
         Ask the remote server to return an handle on a given subkey
         """
+        # If we don't have a root handle, we cannot get a subkey handle
+        # This is a safety check, as we should not be able to call this function
+        # without having a root handle already set.
+        if self._require_root_handles(silent=True):
+            return None
         if str(subkey_path) == ".":
             subkey_path = "\x00"
         else:
             subkey_path = str(subkey_path) + "\x00"
 
-        # print(f"getting handle on: {subkey_path}")
+        # If no access rights were specified, we use the default read access rights
+        if desired_access_rights is None:
+            # Default to read access rights
+            desired_access_rights = (
+                AccessRights.KEY_QUERY_VALUE
+                | AccessRights.KEY_ENUMERATE_SUB_KEYS
+                | AccessRights.STANDARD_RIGHTS_READ
+            )
+
+        logger.debug(
+            "Getting handle on subkey: %s with access rights: %s",
+            subkey_path,
+            desired_access_rights,
+        )
         req = BaseRegOpenKey_Request(
             hKey=self.current_root_handle,
             lpSubKey=RPC_UNICODE_STRING(Buffer=subkey_path),
-            samDesired=KEY_QUERY_VALUE
-            | KEY_ENUMERATE_SUB_KEYS
-            | STANDARD_RIGHTS_READ,  # | MAX_ALLOWED,
+            samDesired=desired_access_rights,
         )
+
         resp = self.client.sr1_req(req)
-        if resp.status == ERROR_SUBKEY_NOT_FOUND:
-            print(f"[-] Error : got status {hex(resp.status)} while enumerating keys")
+        if not is_status_ok(resp.status):
+            logger.error(
+                "[-] Error : got status %s while enumerating keys", hex(resp.status)
+            )
             return None
 
         return resp.phkResult
+
+    def _get_handle(
+        self, folder: Optional[str] = None, desired_access: Optional[IntFlag] = None
+    ) -> NDRContextHandle:
+        """
+        Get the handle on the current subkey or the specified folder.
+        If no folder is specified, it uses the current subkey path.
+        """
+        if self._require_root_handles(silent=True):
+            return None
+
+        # If no specific folder was specified
+        # we use our current subkey path
+        if folder is None or folder == "" or folder == ".":
+            subkey_path = self.current_subkey_path
+            handle = self.current_subkey_handle
+
+        # Otherwise we use the folder path,
+        # the calling parent shall make sure that this path was properly sanitized
+        else:
+            subkey_path = self._join_path(self.current_subkey_path, folder)
+            handle = self.get_handle_on_subkey(subkey_path, desired_access)
+            if handle is None:
+                logger.error("Could not get handle on %s", subkey_path)
+                return None
+
+        return handle
 
     def _join_path(self, first_path: str, second_path: str) -> PureWindowsPath:
         return PureWindowsPath(
@@ -782,6 +1060,22 @@ class regclient(CLIUtil):
             )
         )
 
+    def _require_root_handles(self, silent: bool = False) -> bool:
+        if self.current_root_handle is None:
+            if not silent:
+                print("No root key selected ! Use 'use' to use one.")
+            return True
+        return False
+
+    @CLIUtil.addcommand()
+    def dev(self) -> NoReturn:
+        """
+        Joker function to jump into the python code for dev purpose
+        """
+        logger.info("Jumping into the code for dev purpose...")
+        # pylint: disable=forgotten-debug-statement, pointless-statement
+        breakpoint()
+
 
 def main():
     """
@@ -789,10 +1083,10 @@ def main():
     """
     from scapy.utils import AutoArgparse
 
-    AutoArgparse(regclient)
+    AutoArgparse(RegClient)
 
 
 if __name__ == "__main__":
     from scapy.utils import AutoArgparse
 
-    AutoArgparse(regclient)
+    AutoArgparse(RegClient)
