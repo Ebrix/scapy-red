@@ -787,16 +787,8 @@ class RegClient(CLIUtil):
                 # The buffer was too small, we need to retry with a larger one
                 req.lpcbData = resp2.lpcbData
                 req.lpData.value.max_count = resp2.lpcbData.value
-<<<<<<< HEAD
-                return results
-                resp2 = self.client.sr1_req(req, timeout=1)
-=======
-<<<<<<< HEAD
                 resp2 = self.client.sr1_req(req)
-=======
                 return results
->>>>>>> 886efa0 (Clean up and some reorganisation)
->>>>>>> 1e91a3c (Clean up and some reorganisation)
 
             if resp2.status:
                 print(
