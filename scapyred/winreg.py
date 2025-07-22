@@ -2,6 +2,7 @@
 DCE/RPC client
 """
 
+from dataclasses import dataclass
 import socket
 import os
 import logging
@@ -216,12 +217,10 @@ def is_status_ok(status: int) -> bool:
             ErrorCodes.ERROR_MORE_DATA,
         ]:
             print(f"[!] Error: {hex(err.value)} - {ErrorCodes(status).name}")
-            breakpoint()
             return False
         return True
     except ValueError as exc:
         print(f"[!] Error: {hex(status)} - Unknown error code")
-        breakpoint()
         raise ValueError(f"Error: {hex(status)} - Unknown error code") from exc
 
 
@@ -235,6 +234,12 @@ AVAILABLE_ROOT_KEYS: list[str] = [
     RootKeys.HKEY_PERFORMANCE_TEXT,
     RootKeys.HKEY_PERFORMANCE_NLSTEXT,
 ]
+
+READ_ACCESS_RIGHTS = (
+    AccessRights.KEY_QUERY_VALUE
+    | AccessRights.KEY_ENUMERATE_SUB_KEYS
+    | AccessRights.STANDARD_RIGHTS_READ
+)
 
 
 class RegEntry:
@@ -284,6 +289,17 @@ class RegEntry:
 
     def __repr__(self) -> str:
         return f"RegEntry({self.reg_value}, {self.reg_type}, {self.reg_data})"
+
+
+@dataclass
+class CacheElt:
+    """
+    Cache element to store the handle and the subkey path
+    """
+
+    handle: NDRContextHandle
+    access: AccessRights
+    values: list
 
 
 @conf.commands.register
@@ -427,8 +443,11 @@ class RegClient(CLIUtil):
         self.client.connect(target)
         self.client.open_smbpipe("winreg")
         self.client.bind(self.interface)
-        self.ls_cache: dict[str:list] = dict()
-        self.cat_cache: dict[str:list] = dict()
+        self.cache: dict[str : dict[str, CacheElt]] = {
+            "ls": dict(),
+            "cat": dict(),
+            "cd": dict(),
+        }
         self.root_handle = {}
         self.current_root_handle = None
         self.current_subkey_handle = None
@@ -472,16 +491,12 @@ class RegClient(CLIUtil):
             - Determines which registry root to use based on the prefix of `root_path`.
             - Opens the corresponding registry root handle if not already opened, using the appropriate request.
             - Sets `self.current_root_handle` and `self.current_root_path` to the selected root.
-            - Clears the local subkey cache (`self.ls_cache`).
+            - Clears the local subkey cache
             - Changes the current directory to the root of the selected registry hive.
         """
 
-        default_read_access_rights = (
-            AccessRights.KEY_QUERY_VALUE
-            | AccessRights.KEY_ENUMERATE_SUB_KEYS
-            | AccessRights.STANDARD_RIGHTS_READ
-        )
-        root_path = RootKeys(root_path)
+        default_read_access_rights = READ_ACCESS_RIGHTS
+        root_path = RootKeys(root_path.upper().strip())
 
         match root_path:
             case RootKeys.HKEY_CLASSES_ROOT:
@@ -586,14 +601,14 @@ class RegClient(CLIUtil):
             case _:
                 # If the root key is not recognized, raise an error
                 print(f"Unknown root key: {root_path}")
-                self.ls_cache.clear()
+                self._clear_all_caches()
                 self.current_root_handle = None
                 self.current_root_path = "CHOOSE ROOT KEY"
                 self.cd("")
                 return
 
         self.current_root_path = root_path.value
-        self.ls_cache.clear()
+        self._clear_all_caches()
         self.cd("")
 
     @CLIUtil.addcomplete(use)
@@ -615,39 +630,24 @@ class RegClient(CLIUtil):
         """
         EnumKeys of the current subkey path
         """
-        # If no specific folder was specified
-        # we use our current subkey path
-        if folder is None or folder == "":
-            cache = self.ls_cache.get(self.current_subkey_path)
-            subkey_path = self.current_subkey_path
 
-            # if the resolution was already performed,
+        res = self._get_cached_elt(folder=folder, cache_name="ls")
+        if res is None:
+            return []
+        elif len(res.values) != 0:
+            # If the resolution was already performed,
             # no need to query again the RPC
-            if cache:
-                return cache
+            return res.values
 
-            # The first time we do an ls we need to get
-            # a proper handle
-            if self.current_subkey_handle is None:
-                self.current_subkey_handle = self.get_handle_on_subkey(
-                    PureWindowsPath("")
-                )
+        if folder is None:
+            folder = ""
 
-            handle = self.current_subkey_handle
+        subkey_path = self._join_path(self.current_subkey_path, folder)
 
-        # Otherwise we use the folder path,
-        # the calling parent shall make sure that this path was properly sanitized
-        else:
-            subkey_path = self._join_path(self.current_subkey_path, folder)
-            handle = self.get_handle_on_subkey(subkey_path)
-            if handle is None:
-                return []
-
-        self.ls_cache[subkey_path] = list()
         idx = 0
         while True:
             req = BaseRegEnumKey_Request(
-                hKey=handle,
+                hKey=res.handle,
                 dwIndex=idx,
                 lpNameIn=RPC_UNICODE_STRING(MaximumLength=1024),
                 lpClassIn=RPC_UNICODE_STRING(),
@@ -661,15 +661,15 @@ class RegClient(CLIUtil):
                 print(
                     f"[-] Error : got status {hex(resp.status)} while enumerating keys"
                 )
-                self.ls_cache.clear()
+                self.cache["ls"].pop(subkey_path, None)
                 return []
 
-            self.ls_cache[subkey_path].append(
+            self.cache["ls"][subkey_path].values.append(
                 resp.lpNameOut.valueof("Buffer").decode("utf-8").strip("\x00")
             )
             idx += 1
 
-        return self.ls_cache[subkey_path]
+        return self.cache["ls"][subkey_path].values
 
     @CLIUtil.addoutput(ls)
     def ls_output(self, results: list[str]) -> NoReturn:
@@ -711,39 +711,21 @@ class RegClient(CLIUtil):
             - May print error messages to standard output if RPC queries fail.
             - Updates internal cache for previously enumerated subkey paths.
         """
-        # If no specific folder was specified
-        # we use our current subkey path
-        if folder is None or folder == "":
-            cache = self.cat_cache.get(self.current_subkey_path)
-            subkey_path = self.current_subkey_path
-
-            # if the resolution was already performed,
+        res = self._get_cached_elt(folder=folder, cache_name="cat")
+        if res is None:
+            return []
+        elif len(res.values) != 0:
+            # If the resolution was already performed,
             # no need to query again the RPC
-            if cache:
-                return cache
+            return res.values
 
-            # The first time we do a cat we need to get
-            # a proper handle
-            if self.current_subkey_handle is None:
-                self.current_subkey_handle = self.get_handle_on_subkey(
-                    PureWindowsPath("")
-                )
-
-            handle = self.current_subkey_handle
-
-        # Otherwise we use the folder path,
-        # the calling parent shall make sure that this path was properly sanitized
-        else:
-            subkey_path = self._join_path(self.current_subkey_path, folder)
-            handle = self.get_handle_on_subkey(subkey_path)
-            if handle is None:
-                return []
+        subkey_path = self._join_path(self.current_subkey_path, folder)
 
         idx = 0
-        results = []
         while True:
+            # Get the name of the value at index idx
             req = BaseRegEnumValue_Request(
-                hKey=handle,
+                hKey=res.handle,
                 dwIndex=idx,
                 lpValueNameIn=RPC_UNICODE_STRING(
                     MaximumLength=2048,
@@ -766,11 +748,13 @@ class RegClient(CLIUtil):
                 print(
                     f"[-] Error : got status {hex(resp.status)} while enumerating values"
                 )
-                self.cat_cache.clear()
+                self.cache["cat"].pop(subkey_path, None)
                 return []
 
+            # Get the value name and type
+            # for the name we got earlier
             req = BaseRegQueryValue_Request(
-                hKey=handle,
+                hKey=res.handle,
                 lpValueName=resp.valueof("lpValueNameOut"),
                 lpType=0,
                 lpcbData=1024,
@@ -788,18 +772,18 @@ class RegClient(CLIUtil):
                 req.lpcbData = resp2.lpcbData
                 req.lpData.value.max_count = resp2.lpcbData.value
                 resp2 = self.client.sr1_req(req)
-                return results
 
-            if resp2.status:
+            if not is_status_ok(resp2.status):
                 print(
                     f"[-] Error : got status {hex(resp2.status)} while querying value"
                 )
+                self.cache["cat"].pop(subkey_path, None)
                 return []
 
             value = (
                 resp.valueof("lpValueNameOut").valueof("Buffer").decode("utf-8").strip()
             )
-            results.append(
+            self.cache["cat"][subkey_path].values.append(
                 RegEntry(
                     reg_value=value,
                     reg_type=resp2.valueof("lpType"),
@@ -807,12 +791,9 @@ class RegClient(CLIUtil):
                 )
             )
 
-            # self.cat_cache[subkey_path].append(
-            #     resp.valueof("lpValueNameOut").valueof("Buffer").decode("utf-8").strip()
-            # )
             idx += 1
 
-        return results
+        return self.cache["cat"][subkey_path].values
 
     @CLIUtil.addoutput(cat)
     def cat_output(self, results: list[RegEntry]) -> None:
@@ -828,6 +809,19 @@ class RegClient(CLIUtil):
                 f"  - {entry.reg_value:<20} {'(' + entry.reg_type.name + ')':<15} {entry.reg_data}"
             )
 
+    @CLIUtil.addcomplete(cat)
+    def cat_complete(self, folder: str) -> list[str]:
+        """
+        Auto-complete cat
+        """
+        if self._require_root_handles(silent=True):
+            return []
+        return [
+            str(subk)
+            for subk in self.ls()
+            if str(subk).lower().startswith(folder.lower())
+        ]
+
     # --------------------------------------------- #
     #                   Change Directory
     # --------------------------------------------- #
@@ -840,10 +834,15 @@ class RegClient(CLIUtil):
         if subkey.strip() == "":
             # If the subkey is ".", we do not change the current subkey path
             tmp_path = PureWindowsPath()
-        else:
-            tmp_path = self._join_path(self.current_subkey_path, subkey)
+            tmp_handle = self.get_handle_on_subkey(tmp_path)
 
-        tmp_handle = self.get_handle_on_subkey(tmp_path)
+        else:
+            res = self._get_cached_elt(
+                folder=subkey,
+                cache_name="cd",
+            )
+            tmp_handle = res.handle if res else None
+            tmp_path = self._join_path(self.current_subkey_path, subkey)
 
         if tmp_handle is not None:
             # If the handle was successfully retrieved,
@@ -874,22 +873,9 @@ class RegClient(CLIUtil):
         Get the security descriptor of the current subkey. SACL are not retrieve at this point (TODO).
 
         """
-        if self._require_root_handles(silent=True):
-            return
-
-        # If no specific folder was specified
-        # we use our current subkey path
-        if folder is None or folder == "":
-            subkey_path = self.current_subkey_path
-            handle = self.current_subkey_handle
-
-        # Otherwise we use the folder path,
-        # the calling parent shall make sure that this path was properly sanitized
-        else:
-            subkey_path = self._join_path(self.current_subkey_path, folder)
-            handle = self.get_handle_on_subkey(subkey_path)
-            if handle is None:
-                return None
+        handle = self._get_cached_elt(folder=folder)
+        if handle is None:
+            return None
 
         req = BaseRegGetKeySecurity_Request(
             hKey=handle,
@@ -928,7 +914,7 @@ class RegClient(CLIUtil):
         """
         Query information on the current subkey
         """
-        handle = self._get_handle(folder)
+        handle = self._get_cached_elt(folder)
         if handle is None:
             logger.error("Could not get handle on the specified subkey.")
             return None
@@ -1015,9 +1001,12 @@ Info on key: {self.current_subkey_path}
 
         return resp.phkResult
 
-    def _get_handle(
-        self, folder: Optional[str] = None, desired_access: Optional[IntFlag] = None
-    ) -> NDRContextHandle:
+    def _get_cached_elt(
+        self,
+        folder: Optional[str] = None,
+        cache_name: str = None,
+        desired_access: Optional[IntFlag] = None,
+    ) -> Optional[NDRContextHandle | CacheElt]:
         """
         Get the handle on the current subkey or the specified folder.
         If no folder is specified, it uses the current subkey path.
@@ -1025,22 +1014,38 @@ Info on key: {self.current_subkey_path}
         if self._require_root_handles(silent=True):
             return None
 
+        if desired_access is None:
+            # Default to read access rights
+            desired_access = READ_ACCESS_RIGHTS
+
         # If no specific folder was specified
         # we use our current subkey path
         if folder is None or folder == "" or folder == ".":
             subkey_path = self.current_subkey_path
-            handle = self.current_subkey_handle
-
         # Otherwise we use the folder path,
         # the calling parent shall make sure that this path was properly sanitized
         else:
             subkey_path = self._join_path(self.current_subkey_path, folder)
-            handle = self.get_handle_on_subkey(subkey_path, desired_access)
-            if handle is None:
-                logger.error("Could not get handle on %s", subkey_path)
-                return None
 
-        return handle
+        if (
+            self.cache.get(cache_name, None) is not None
+            and self.cache[cache_name].get(subkey_path, None) is not None
+            and self.cache[cache_name][subkey_path].access == desired_access
+        ):
+            # If we have a cache, we check if the handle is already cached
+            # If the access rights are the same, we return the cached elt
+            return self.cache[cache_name][subkey_path]
+
+        handle = self.get_handle_on_subkey(subkey_path, desired_access)
+        if handle is None:
+            logger.error("Could not get handle on %s", subkey_path)
+            return None
+
+        cache_elt = CacheElt(handle, desired_access, [])
+        if cache_name is not None:
+            self.cache[cache_name][subkey_path] = cache_elt
+
+        return cache_elt if cache_name is not None else handle
 
     def _join_path(self, first_path: str, second_path: str) -> PureWindowsPath:
         return PureWindowsPath(
@@ -1058,6 +1063,13 @@ Info on key: {self.current_subkey_path}
                 print("No root key selected ! Use 'use' to use one.")
             return True
         return False
+
+    def _clear_all_caches(self) -> None:
+        """
+        Clear all caches
+        """
+        for key in self.cache.keys():
+            self.cache[key].clear()
 
     @CLIUtil.addcommand()
     def dev(self) -> NoReturn:
