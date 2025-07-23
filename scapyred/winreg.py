@@ -85,6 +85,19 @@ class AccessRights(IntFlag):
     MAX_ALLOWED = 0x02000000
 
 
+class RegOptions(IntFlag):
+    """
+    Registry options for registry keys
+    """
+
+    REG_OPTION_NON_VOLATILE = 0x00000000
+    REG_OPTION_VOLATILE = 0x00000001
+    REG_OPTION_CREATE_LINK = 0x00000002
+    REG_OPTION_BACKUP_RESTORE = 0x00000004
+    REG_OPTION_OPEN_LINK = 0x00000008
+    REG_OPTION_DONT_VIRTUALIZE = 0x00000010
+
+
 class ErrorCodes(IntEnum):
     """
     Error codes for registry operations
@@ -448,6 +461,9 @@ class RegClient(CLIUtil):
             "cat": dict(),
             "cd": dict(),
         }
+        # Options for registry operations default to non-volatile
+        # This means that the registry key will not be deleted when the system is restarted.
+        self.extra_options = RegOptions.REG_OPTION_NON_VOLATILE
         self.root_handle = {}
         self.current_root_handle = None
         self.current_subkey_handle = None
@@ -951,6 +967,52 @@ Info on key: {self.current_subkey_path}
         print(f"Remote registry server version: {version}")
 
     # --------------------------------------------- #
+    #                   Operation options
+    # --------------------------------------------- #
+
+    @CLIUtil.addcommand()
+    def activate_backup(self) -> None:
+        """
+        Activate the backup option for the registry operations (enable your backup privilege).
+        This enable the backup privilege for the current session.
+        """
+        self.extra_options |= RegOptions.REG_OPTION_BACKUP_RESTORE
+        print("Backup option activated.")
+        # Clear the local cache, as the backup option will change the behavior of the registry
+        self._clear_all_caches()
+
+    @CLIUtil.addcommand()
+    def disable_backup(self) -> None:
+        """
+        Disable the backup option for the registry operations (disable your backup privilege).
+        This disable the backup privilege for the current session.
+        """
+        self.extra_options &= ~RegOptions.REG_OPTION_BACKUP_RESTORE
+        print("Backup option deactivated.")
+        self._clear_all_caches()
+
+    def switch_volatile(self) -> None:
+        """
+        Set the registry operations to be volatile.
+        This means that the registry key will be deleted when the system is restarted.
+        """
+        self.extra_options |= RegOptions.REG_OPTION_VOLATILE
+        self.extra_options &= ~RegOptions.REG_OPTION_NON_VOLATILE
+        print("Volatile option activated.")
+
+        self._clear_all_caches()
+
+    def disable_volatile(self) -> None:
+        """
+        Disable the volatile option for the registry operations.
+        This means that the registry key will not be deleted when the system is restarted.
+        """
+        self.extra_options &= ~RegOptions.REG_OPTION_VOLATILE
+        self.extra_options |= RegOptions.REG_OPTION_NON_VOLATILE
+        print("Volatile option deactivated.")
+        self._clear_all_caches()
+
+    # --------------------------------------------- #
     #                   Utils
     # --------------------------------------------- #
 
@@ -990,6 +1052,7 @@ Info on key: {self.current_subkey_path}
             hKey=self.current_root_handle,
             lpSubKey=RPC_UNICODE_STRING(Buffer=subkey_path),
             samDesired=desired_access_rights,
+            dwOptions=self.extra_options,
         )
 
         resp = self.client.sr1_req(req)
