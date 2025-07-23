@@ -30,6 +30,7 @@ from scapy.layers.msrpce.raw.ms_rrp import (
     BaseRegGetVersion_Request,
     BaseRegQueryInfoKey_Request,
     BaseRegGetKeySecurity_Request,
+    BaseRegSaveKey_Request,
     PRPC_SECURITY_DESCRIPTOR,
     NDRContextHandle,
     RPC_UNICODE_STRING,
@@ -931,6 +932,7 @@ class RegClient(CLIUtil):
         Query information on the current subkey
         """
         handle = self._get_cached_elt(folder)
+        breakpoint()
         if handle is None:
             logger.error("Could not get handle on the specified subkey.")
             return None
@@ -965,6 +967,39 @@ Info on key: {self.current_subkey_path}
             BaseRegGetVersion_Request(hKey=self.current_root_handle)
         ).lpdwVersion
         print(f"Remote registry server version: {version}")
+
+    # --------------------------------------------- #
+    #                   Backup and Restore
+    # --------------------------------------------- #
+
+    @CLIUtil.addcommand()
+    def backup(
+        self, folder: Optional[str] = None, output_path: Optional[str] = None
+    ) -> None:
+        """
+        Backup the current subkey to a file.
+        If no folder is specified, it uses the current subkey path.
+        """
+        self.activate_backup()
+        handle = self._get_cached_elt(folder=folder)
+        if handle is None:
+            logger.error("Could not get handle on the specified subkey.")
+            return None
+
+        req = BaseRegSaveKey_Request(
+            hKey=handle,
+            lpFile=RPC_UNICODE_STRING(Buffer=f"C:\\AAAAAAAAAAAAAAAA.reg\x00"),
+            pSecurityAttributes=None,  # No security attributes - Tout le monde peut lire OKLM
+        )
+
+        resp = self.client.sr1_req(req)
+        if not is_status_ok(resp.status):
+            logger.error("Got status %s while backing up", hex(resp.status))
+            return None
+
+        print(
+            f"Backup of {self.current_subkey_path} saved to {self.current_subkey_path}.reg"
+        )
 
     # --------------------------------------------- #
     #                   Operation options
