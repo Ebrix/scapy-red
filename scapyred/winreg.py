@@ -1011,6 +1011,10 @@ Info on key: {self.current_subkey_path}
         Activate the backup option for the registry operations (enable your backup privilege).
         This enable the backup privilege for the current session.
         """
+        # check if backup privilege is already enabled
+        if self.extra_options & RegOptions.REG_OPTION_BACKUP_RESTORE:
+            print("Backup option is already activated. Didn't do anything.")
+            return
         self.extra_options |= RegOptions.REG_OPTION_BACKUP_RESTORE
         print("Backup option activated.")
         # Clear the local cache, as the backup option will change the behavior of the registry
@@ -1022,6 +1026,10 @@ Info on key: {self.current_subkey_path}
         Disable the backup option for the registry operations (disable your backup privilege).
         This disable the backup privilege for the current session.
         """
+        # check if backup privilege is already disabled
+        if not self.extra_options & RegOptions.REG_OPTION_BACKUP_RESTORE:
+            print("Backup option is already disabled. Didn't do anything.")
+            return
         self.extra_options &= ~RegOptions.REG_OPTION_BACKUP_RESTORE
         print("Backup option deactivated.")
         self._clear_all_caches()
