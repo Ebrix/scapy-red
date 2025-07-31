@@ -7,13 +7,48 @@ import socket
 import os
 import logging
 
-from enum import IntEnum, IntFlag, StrEnum
-
+from enum import IntEnum, IntFlag, StrEnum, Enum
 from ctypes.wintypes import PFILETIME
 from typing import Optional, NoReturn
 from pathlib import PureWindowsPath
 
-# pylint: disable-next=import-error, no-name-in-module
+from scapy.themes import DefaultTheme
+from scapy.base_classes import Net
+from scapy.utils import (
+    CLIUtil,
+    valid_ip,
+    valid_ip6,
+)
+from scapy.utils6 import Net6
+from scapy.layers.kerberos import (
+    KerberosSSP,
+    krb_as_and_tgs,
+    _parse_upn,
+)
+from scapy.layers.msrpce.rpcclient import DCERPC_Client
+from scapy.layers.dcerpc import find_dcerpc_interface, DCERPC_Transport
+from scapy.layers.ntlm import MD4le, NTLMSSP
+from scapy.layers.spnego import SPNEGOSSP
+from scapy.layers.smb2 import (
+    SECURITY_DESCRIPTOR,
+    WINNT_SID,
+    WINNT_ACL,
+    WINNT_ACE_HEADER,
+    WINNT_ACCESS_ALLOWED_ACE,
+)
+from scapy.layers.dcerpc import (
+    RPC_C_AUTHN_LEVEL,
+    NDRConformantArray,
+    NDRPointer,
+    NDRVaryingArray,
+)
+from scapy.config import conf
+
+# pylint: disable-next=too-many-function-args
+conf.exts.load("scapy-rpc")
+conf.color_theme = DefaultTheme()
+
+# pylint: disable-next=import-error, no-name-in-module, wrong-import-position
 from scapy.layers.msrpce.raw.ms_rrp import (
     OpenClassesRoot_Request,
     OpenLocalMachine_Request,
@@ -32,37 +67,13 @@ from scapy.layers.msrpce.raw.ms_rrp import (
     BaseRegGetKeySecurity_Request,
     BaseRegSaveKey_Request,
     PRPC_SECURITY_DESCRIPTOR,
+    PRPC_SECURITY_ATTRIBUTES,
+    RPC_SECURITY_DESCRIPTOR,
     NDRContextHandle,
     RPC_UNICODE_STRING,
 )
-from scapy.layers.dcerpc import (
-    RPC_C_AUTHN_LEVEL,
-    NDRConformantArray,
-    NDRPointer,
-    NDRVaryingArray,
-)
-from scapy.utils import (
-    CLIUtil,
-    valid_ip,
-    valid_ip6,
-)
-from scapy.layers.kerberos import (
-    KerberosSSP,
-    krb_as_and_tgs,
-    _parse_upn,
-)
-from scapy.config import conf
-from scapy.themes import DefaultTheme
-from scapy.base_classes import Net
-from scapy.utils6 import Net6
-from scapy.layers.msrpce.rpcclient import DCERPC_Client
-from scapy.layers.dcerpc import find_dcerpc_interface, DCERPC_Transport
-from scapy.layers.ntlm import MD4le, NTLMSSP
-from scapy.layers.spnego import SPNEGOSSP
-from scapy.layers.smb2 import SECURITY_DESCRIPTOR
 
 
-conf.color_theme = DefaultTheme()
 logging.basicConfig(
     level=logging.INFO,
     format="[%(levelname)s][%(funcName)s] %(message)s",
@@ -84,6 +95,7 @@ class AccessRights(IntFlag):
     KEY_ENUMERATE_SUB_KEYS = 0x00000008
     STANDARD_RIGHTS_READ = 0x00020000
     MAX_ALLOWED = 0x02000000
+    FILE_ALL_ACCESS = 0x001F01FF
 
 
 class RegOptions(IntFlag):
@@ -256,6 +268,35 @@ READ_ACCESS_RIGHTS = (
 )
 
 
+class WellKnownSIDs(Enum):
+    """
+    Well-known SIDs.
+    """
+
+    SY = WINNT_SID.fromstr("S-1-5-18")  # Local System
+    BA = WINNT_SID.fromstr("S-1-5-32-544")  # Built-in Administrators
+
+
+DEFAULT_SECURITY_DESCRIPTOR = SECURITY_DESCRIPTOR(
+    Control=0x1000 | 0x8000 | 0x4,
+    OwnerSid=WellKnownSIDs.SY.value,  # Local System SID
+    GroupSid=WellKnownSIDs.SY.value,  # Local System SID
+    DACL=WINNT_ACL(
+        Aces=[
+            WINNT_ACE_HEADER(
+                AceType=0x0,  # ACCESS_ALLOWED_ACE_TYPE
+                AceFlags=0x0,  # No flags
+            )
+            / WINNT_ACCESS_ALLOWED_ACE(
+                Mask=0x00020000,  # Read access rights
+                Sid=WellKnownSIDs.SY.value,  # Built-in Administrators SID
+            ),
+        ],
+    ),
+    ndr64=True,
+)
+
+
 class RegEntry:
     """
     RegEntry to properly parse the data based on the type.
@@ -272,31 +313,30 @@ class RegEntry:
         except ValueError:
             self.reg_type = RegType.UNK
 
-        if (
-            self.reg_type == RegType.REG_MULTI_SZ
-            or self.reg_type == RegType.REG_SZ
-            or self.reg_type == RegType.REG_EXPAND_SZ
-        ):
-            if self.reg_type == RegType.REG_MULTI_SZ:
-                # decode multiple null terminated strings
-                self.reg_data = reg_data.decode("utf-16le")[:-2].replace("\x00", "\n")
-            else:
+        match self.reg_type:
+            case RegType.REG_MULTI_SZ | RegType.REG_SZ | RegType.REG_EXPAND_SZ:
+                if self.reg_type == RegType.REG_MULTI_SZ:
+                    # decode multiple null terminated strings
+                    self.reg_data = reg_data.decode("utf-16le")[:-2].replace(
+                        "\x00", "\n"
+                    )
+                else:
+                    self.reg_data = reg_data.decode("utf-16le")
+
+            case RegType.REG_BINARY:
+                self.reg_data = reg_data
+
+            case RegType.REG_DWORD | RegType.REG_QWORD:
+                self.reg_data = int.from_bytes(reg_data, byteorder="little")
+
+            case RegType.REG_DWORD_BIG_ENDIAN:
+                self.reg_data = int.from_bytes(reg_data, byteorder="big")
+
+            case RegType.REG_LINK:
                 self.reg_data = reg_data.decode("utf-16le")
 
-        elif self.reg_type == RegType.REG_BINARY:
-            self.reg_data = reg_data
-
-        elif self.reg_type == RegType.REG_DWORD or self.reg_type == RegType.REG_QWORD:
-            self.reg_data = int.from_bytes(reg_data, byteorder="little")
-
-        elif self.reg_type == RegType.REG_DWORD_BIG_ENDIAN:
-            self.reg_data = int.from_bytes(reg_data, byteorder="big")
-
-        elif self.reg_type == RegType.REG_LINK:
-            self.reg_data = reg_data.decode("utf-16le")
-
-        else:
-            self.reg_data = reg_data
+            case _:
+                self.reg_data = reg_data
 
     def __str__(self) -> str:
         return f"{self.reg_value} ({self.reg_type.name}) {self.reg_data}"
@@ -334,6 +374,7 @@ class RegClient(CLIUtil):
     :param KEY: if provided, the session key associated to the ticket (Kerberos)
     :param cli: CLI mode (default True). False to use for scripting
     :param rootKey: the root key to get a handle to (HKLM, HKCU, etc.), in CLI mode you can chose it later
+    :param subKey: the subkey to use (default None, in CLI mode you can chose it later)
 
 
     Some additional SMB parameters are available under help(SMB_Client). Some of
@@ -359,6 +400,7 @@ class RegClient(CLIUtil):
         KEY=None,
         cli=True,
         rootKey: str = None,
+        subKey: str = None,
         # SMB arguments
         **kwargs,
     ):
@@ -438,7 +480,7 @@ class RegClient(CLIUtil):
             DCERPC_Transport.NCACN_NP,
             auth_level=RPC_C_AUTHN_LEVEL.PKT_PRIVACY,
             ssp=ssp,
-            ndr64=False,
+            ndr64=True,
         )
         if debug:
             logger.setLevel(logging.DEBUG)
@@ -454,8 +496,17 @@ class RegClient(CLIUtil):
 
         self.timeout = timeout
         self.client.verb = False
-        self.client.connect(target)
-        self.client.open_smbpipe("winreg")
+        try:
+            self.client.connect(target)
+            self.client.open_smbpipe("winreg")
+        except ValueError as exc:
+            if "3221225644" in str(exc):
+                print(
+                    "[!] Warn: Remote service didn't seem to be running. Let's try again now that we should have trigger it."
+                )
+                self.client.open_smbpipe("winreg")
+            else:
+                raise exc
         self.client.bind(self.interface)
         self.cache: dict[str : dict[str, CacheElt]] = {
             "ls": dict(),
@@ -474,6 +525,8 @@ class RegClient(CLIUtil):
             self.use(self.current_root_path)
         else:
             self.current_root_path = "CHOOSE ROOT KEY"
+        if subKey:
+            self.cd(subKey.strip())
         if cli:
             self.loop(debug=debug)
 
@@ -522,7 +575,9 @@ class RegClient(CLIUtil):
                     RootKeys.HKEY_CLASSES_ROOT.value,
                     self.client.sr1_req(
                         OpenClassesRoot_Request(
-                            ServerName=None, samDesired=default_read_access_rights
+                            ServerName=None,
+                            samDesired=default_read_access_rights,
+                            ndr64=True,
                         ),
                         timeout=self.timeout,
                     ).phKey,
@@ -536,6 +591,7 @@ class RegClient(CLIUtil):
                         OpenCurrentUser_Request(
                             ServerName=None,
                             samDesired=default_read_access_rights,
+                            ndr64=True,
                         ),
                         timeout=self.timeout,
                     ).phKey,
@@ -549,6 +605,7 @@ class RegClient(CLIUtil):
                         OpenLocalMachine_Request(
                             ServerName=None,
                             samDesired=default_read_access_rights,
+                            ndr64=True,
                         ),
                         timeout=self.timeout,
                     ).phKey,
@@ -562,6 +619,7 @@ class RegClient(CLIUtil):
                         OpenCurrentConfig_Request(
                             ServerName=None,
                             samDesired=default_read_access_rights,
+                            ndr64=True,
                         ),
                         timeout=self.timeout,
                     ).phKey,
@@ -574,6 +632,7 @@ class RegClient(CLIUtil):
                         OpenUsers_Request(
                             ServerName=None,
                             samDesired=default_read_access_rights,
+                            ndr64=True,
                         ),
                         timeout=self.timeout,
                     ).phKey,
@@ -586,6 +645,7 @@ class RegClient(CLIUtil):
                         OpenPerformanceData_Request(
                             ServerName=None,
                             samDesired=default_read_access_rights,
+                            ndr64=True,
                         ),
                         timeout=self.timeout,
                     ).phKey,
@@ -598,6 +658,7 @@ class RegClient(CLIUtil):
                         OpenPerformanceText_Request(
                             ServerName=None,
                             samDesired=default_read_access_rights,
+                            ndr64=True,
                         ),
                         timeout=self.timeout,
                     ).phKey,
@@ -610,6 +671,7 @@ class RegClient(CLIUtil):
                         OpenPerformanceNlsText_Request(
                             ServerName=None,
                             samDesired=default_read_access_rights,
+                            ndr64=True,
                         ),
                         timeout=self.timeout,
                     ).phKey,
@@ -669,6 +731,7 @@ class RegClient(CLIUtil):
                 lpNameIn=RPC_UNICODE_STRING(MaximumLength=1024),
                 lpClassIn=RPC_UNICODE_STRING(),
                 lpftLastWriteTime=None,
+                ndr64=True,
             )
 
             resp = self.client.sr1_req(req)
@@ -756,6 +819,7 @@ class RegClient(CLIUtil):
                 lpData=None,  # pointer to buffer
                 lpcbData=0,  # pointer to buffer size
                 lpcbLen=0,  # pointer to length
+                ndr64=True,
             )
 
             resp = self.client.sr1_req(req)
@@ -781,6 +845,7 @@ class RegClient(CLIUtil):
                         max_count=1024, value=NDRVaryingArray(actual_count=0, value=b"")
                     )
                 ),
+                ndr64=True,
             )
 
             resp2 = self.client.sr1_req(req)
@@ -902,6 +967,7 @@ class RegClient(CLIUtil):
             pRpcSecurityDescriptorIn=PRPC_SECURITY_DESCRIPTOR(
                 cbInSecurityDescriptor=512,  # Initial size of the buffer
             ),
+            ndr64=True,
         )
 
         resp = self.client.sr1_req(req)
@@ -932,7 +998,6 @@ class RegClient(CLIUtil):
         Query information on the current subkey
         """
         handle = self._get_cached_elt(folder)
-        breakpoint()
         if handle is None:
             logger.error("Could not get handle on the specified subkey.")
             return None
@@ -940,6 +1005,7 @@ class RegClient(CLIUtil):
         req = BaseRegQueryInfoKey_Request(
             hKey=handle,
             lpClassIn=RPC_UNICODE_STRING(),  # pointer to class name
+            ndr64=True,
         )
 
         resp = self.client.sr1_req(req)
@@ -973,7 +1039,7 @@ Info on key: {self.current_subkey_path}
     # --------------------------------------------- #
 
     @CLIUtil.addcommand()
-    def backup(
+    def save(
         self, folder: Optional[str] = None, output_path: Optional[str] = None
     ) -> None:
         """
@@ -982,17 +1048,46 @@ Info on key: {self.current_subkey_path}
         """
         self.activate_backup()
         handle = self._get_cached_elt(folder=folder)
+        key_to_save = (
+            folder.split("\\")[-1] if folder else self.current_subkey_path.name
+        )
+
         if handle is None:
             logger.error("Could not get handle on the specified subkey.")
             return None
 
+        # Default path is %WINDIR%\System32
+        if output_path is None:
+            output_path = str(key_to_save) + ".reg"
+
+        elif output_path.endswith(".reg"):
+            # If the output path ends with .reg, we use it as is
+            output_path = output_path.strip()
+
+        else:
+            # Otherwise, we use the current subkey path as the output path
+            output_path = str(self._join_path(output_path, str(key_to_save) + ".reg"))
+
+        print(f"Backing up {key_to_save} to {output_path}")
+
+        sa = PRPC_SECURITY_ATTRIBUTES(
+            RpcSecurityDescriptor=RPC_SECURITY_DESCRIPTOR(
+                lpSecurityDescriptor=DEFAULT_SECURITY_DESCRIPTOR,
+            ),
+            ndr64=True,
+        )
         req = BaseRegSaveKey_Request(
             hKey=handle,
-            lpFile=RPC_UNICODE_STRING(Buffer=f"C:\\AAAAAAAAAAAAAAAA.reg\x00"),
-            pSecurityAttributes=None,  # No security attributes - Tout le monde peut lire OKLM
+            lpFile=RPC_UNICODE_STRING(Buffer=output_path),
+            pSecurityAttributes=sa,
+            ndr64=True,
         )
 
+        # If the security attributes are not provided, the default security descriptor is used.
+        # Meanning the file will inherite the access rights of the its parent directory.
+        req.show2()
         resp = self.client.sr1_req(req)
+        resp.show()
         if not is_status_ok(resp.status):
             logger.error("Got status %s while backing up", hex(resp.status))
             return None
@@ -1096,6 +1191,7 @@ Info on key: {self.current_subkey_path}
             lpSubKey=RPC_UNICODE_STRING(Buffer=subkey_path),
             samDesired=desired_access_rights,
             dwOptions=self.extra_options,
+            ndr64=True,
         )
 
         resp = self.client.sr1_req(req)
