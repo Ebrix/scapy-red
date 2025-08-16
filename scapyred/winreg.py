@@ -3,31 +3,21 @@ DCE/RPC client
 """
 
 from dataclasses import dataclass
-import socket
 import os
 import logging
 
 from enum import IntEnum, IntFlag, StrEnum, Enum
 from ctypes.wintypes import PFILETIME
-from typing import Optional, NoReturn
+from typing import NoReturn
 from pathlib import PureWindowsPath
 
 from scapy.themes import DefaultTheme
-from scapy.base_classes import Net
 from scapy.utils import (
     CLIUtil,
-    valid_ip,
-    valid_ip6,
 )
-from scapy.utils6 import Net6
-from scapy.layers.kerberos import (
-    KerberosSSP,
-    krb_as_and_tgs,
-    _parse_upn,
-)
+
 from scapy.layers.msrpce.rpcclient import DCERPC_Client
 from scapy.layers.dcerpc import find_dcerpc_interface, DCERPC_Transport
-from scapy.layers.ntlm import MD4le, NTLMSSP
 from scapy.layers.spnego import SPNEGOSSP
 from scapy.layers.smb2 import (
     SECURITY_DESCRIPTOR,
@@ -43,6 +33,7 @@ from scapy.layers.dcerpc import (
     NDRVaryingArray,
 )
 from scapy.config import conf
+from scapy.error import Scapy_Exception
 
 # pylint: disable-next=too-many-function-args
 conf.exts.load("scapy-rpc")
@@ -64,13 +55,16 @@ from scapy.layers.msrpce.raw.ms_rrp import (
     BaseRegQueryValue_Request,
     BaseRegGetVersion_Request,
     BaseRegQueryInfoKey_Request,
+    BaseRegQueryInfoKey_Response,
     BaseRegGetKeySecurity_Request,
     BaseRegSaveKey_Request,
+    BaseRegSetValue_Request,
     PRPC_SECURITY_DESCRIPTOR,
     PRPC_SECURITY_ATTRIBUTES,
     RPC_SECURITY_DESCRIPTOR,
     NDRContextHandle,
     RPC_UNICODE_STRING,
+    NDRIntField,
 )
 
 
@@ -93,9 +87,23 @@ class AccessRights(IntFlag):
     # These constants are used to specify the access rights when opening or creating registry keys.
     KEY_QUERY_VALUE = 0x00000001
     KEY_ENUMERATE_SUB_KEYS = 0x00000008
+    KEY_ALL_ACCESS = 0xF003F  # Combines the STANDARD_RIGHTS_REQUIRED, KEY_QUERY_VALUE, KEY_SET_VALUE, KEY_CREATE_SUB_KEY, KEY_ENUMERATE_SUB_KEYS, KEY_NOTIFY, and KEY_CREATE_LINK access rights.
     STANDARD_RIGHTS_READ = 0x00020000
-    MAX_ALLOWED = 0x02000000
-    FILE_ALL_ACCESS = 0x001F01FF
+    KEY_CREATE_LINK = 0x0020
+    KEY_NOTIFY = 0x0010
+    KEY_READ = 0x20019  # Combines the STANDARD_RIGHTS_READ, KEY_QUERY_VALUE, KEY_ENUMERATE_SUB_KEYS, and KEY_NOTIFY values.
+    KEY_EXECUTE = 0x20019  # Equivalent to KEY_READ.
+    KEY_CREATE_SUB_KEY = 0x0004  # Required to create a subkey of a registry key.
+    KEY_SET_VALUE = 0x0002  # Required to create, delete, or set a registry value.
+    KEY_WOW64_32KEY = 0x0200  # Indicates that an application on 64-bit Windows should operate on the 32-bit registry view.
+    # This flag is ignored by 32-bit Windows. For more information, see Accessing an Alternate Registry View.
+    # This flag must be combined using the OR operator with the other flags in this table that either query or access registry values.
+    # Windows 2000: This flag is not supported.
+    KEY_WOW64_64KEY = 0x0100  # Indicates that an application on 64-bit Windows should operate on the 64-bit registry view.
+    # This flag is ignored by 32-bit Windows. For more information, see Accessing an Alternate Registry View.
+    # This flag must be combined using the OR operator with the other flags in this table that either query or access registry values.
+    # Windows 2000: This flag is not supported.
+    KEY_WRITE = 0x20006  # Combines the STANDARD_RIGHTS_WRITE, KEY_SET_VALUE, and KEY_CREATE_SUB_KEY access rights.
 
 
 class RegOptions(IntFlag):
@@ -117,13 +125,16 @@ class ErrorCodes(IntEnum):
     """
 
     ERROR_SUCCESS = 0x00000000
-    ERROR_ACCESS_DENIED = 0x00000005
     ERROR_FILE_NOT_FOUND = 0x00000002
+    ERROR_PATH_NOT_FOUND = 0x00000003
+    ERROR_ACCESS_DENIED = 0x00000005
     ERROR_INVALID_HANDLE = 0x00000006
     ERROR_NOT_SAME_DEVICE = 0x00000011
     ERROR_WRITE_PROTECT = 0x00000013
     ERROR_INVALID_PARAMETER = 0x00000057
     ERROR_CALL_NOT_IMPLEMENTED = 0x00000057
+    ERROR_INVALID_NAME = 0x0000007B
+    ERROR_ALREADY_EXISTS = 0x000000B7
     ERROR_NO_MORE_ITEMS = 0x00000103
     ERROR_NOACCESS = 0x000003E6
     ERROR_SUBKEY_NOT_FOUND = 0x000006F7
@@ -214,6 +225,26 @@ class RegType(IntEnum):
         print(f"Unknown registry type: {value}, using UNK")
         return cls.UNK
 
+    @classmethod
+    def fromvalue(cls, value: str | int) -> "RegType":
+        """Convert a string to a RegType enum member.
+        :param value: The string representation of the registry type.
+        :return: The corresponding RegType enum member.
+        """
+        if isinstance(value, int):
+            breakpoint()
+            try:
+                return cls(value)
+            except ValueError:
+                print(f"Unknown registry type: {value}, using UNK")
+
+        value = value.strip().upper()
+        try:
+            return cls[int(value)]
+        except (ValueError, KeyError):
+            print(f"Unknown registry type: {value}, using UNK")
+        return cls.UNK
+
 
 def from_filetime_to_datetime(lp_filetime: PFILETIME) -> str:
     """
@@ -261,12 +292,6 @@ AVAILABLE_ROOT_KEYS: list[str] = [
     RootKeys.HKEY_PERFORMANCE_NLSTEXT,
 ]
 
-READ_ACCESS_RIGHTS = (
-    AccessRights.KEY_QUERY_VALUE
-    | AccessRights.KEY_ENUMERATE_SUB_KEYS
-    | AccessRights.STANDARD_RIGHTS_READ
-)
-
 
 class WellKnownSIDs(Enum):
     """
@@ -279,21 +304,29 @@ class WellKnownSIDs(Enum):
 
 DEFAULT_SECURITY_DESCRIPTOR = SECURITY_DESCRIPTOR(
     Control=0x1000 | 0x8000 | 0x4,
-    OwnerSid=WellKnownSIDs.SY.value,  # Local System SID
-    GroupSid=WellKnownSIDs.SY.value,  # Local System SID
+    # OwnerSid=WellKnownSIDs.SY.value,  # Local System SID
+    # GroupSid=WellKnownSIDs.SY.value,  # Local System SID
     DACL=WINNT_ACL(
+        AclRevision=2,
+        Sbz1=0,
+        AclSize=0xFF,
         Aces=[
             WINNT_ACE_HEADER(
                 AceType=0x0,  # ACCESS_ALLOWED_ACE_TYPE
                 AceFlags=0x0,  # No flags
             )
             / WINNT_ACCESS_ALLOWED_ACE(
-                Mask=0x00020000,  # Read access rights
-                Sid=WellKnownSIDs.SY.value,  # Built-in Administrators SID
+                Mask=0x10000000,  # GA
+                Sid=WellKnownSIDs.BA.value,  # Built-in Administrators SID
             ),
         ],
     ),
     ndr64=True,
+)
+
+# For now we force the AclSize to the length of the Acl
+DEFAULT_SECURITY_DESCRIPTOR.Data[0][1][WINNT_ACL].AclSize = len(
+    DEFAULT_SECURITY_DESCRIPTOR.Data[0][1][WINNT_ACL]
 )
 
 
@@ -338,6 +371,36 @@ class RegEntry:
             case _:
                 self.reg_data = reg_data
 
+    @staticmethod
+    def encode_data(reg_type: RegType, data: str) -> bytes:
+        """
+        Encode data based on the type.
+        """
+        match reg_type:
+            case RegType.REG_MULTI_SZ | RegType.REG_SZ | RegType.REG_EXPAND_SZ:
+                if reg_type == RegType.REG_MULTI_SZ:
+                    # decode multiple null terminated strings
+                    return data.replace("\n", "\x00").encode("utf-16le") + b"\x00\x00"
+                else:
+                    return data.decode("utf-16le")
+
+            case RegType.REG_BINARY:
+                return data
+
+            case RegType.REG_DWORD | RegType.REG_QWORD:
+                bit_length = (int(data).bit_length() + 7) // 8
+                return int(data).to_bytes(bit_length, byteorder="little")
+
+            case RegType.REG_DWORD_BIG_ENDIAN:
+                bit_length = (int(data).bit_length() + 7) // 8
+                return int(data).to_bytes(bit_length, byteorder="big")
+
+            case RegType.REG_LINK:
+                return data.encode("utf-16le")
+
+            case _:
+                return data.encode("utf-8")
+
     def __str__(self) -> str:
         return f"{self.reg_value} ({self.reg_type.name}) {self.reg_data}"
 
@@ -363,19 +426,18 @@ class RegClient(CLIUtil):
 
     :param target: can be a hostname, the IPv4 or the IPv6 to connect to
     :param UPN: the upn to use (DOMAIN/USER, DOMAIN\USER, USER@DOMAIN or USER)
+    :param password: (string) if provided, used for auth
     :param guest: use guest mode (over NTLM)
     :param ssp: if provided, use this SSP for auth.
     :param kerberos: if available, whether to use Kerberos or not
     :param kerberos_required: require kerberos
     :param port: the TCP port. default 445
-    :param password: (string) if provided, used for auth
     :param HashNt: (bytes) if provided, used for auth (NTLM)
     :param ST: if provided, the service ticket to use (Kerberos)
     :param KEY: if provided, the session key associated to the ticket (Kerberos)
     :param cli: CLI mode (default True). False to use for scripting
     :param rootKey: the root key to get a handle to (HKLM, HKCU, etc.), in CLI mode you can chose it later
     :param subKey: the subkey to use (default None, in CLI mode you can chose it later)
-
 
     Some additional SMB parameters are available under help(SMB_Client). Some of
     them include the following:
@@ -392,6 +454,8 @@ class RegClient(CLIUtil):
         kerberos: bool = True,
         kerberos_required: bool = False,
         HashNt: str = None,
+        HashAes128Sha96: str = None,
+        HashAes256Sha96: str = None,
         port: int = 445,
         timeout: int = 2,
         debug: int = 0,
@@ -404,70 +468,25 @@ class RegClient(CLIUtil):
         # SMB arguments
         **kwargs,
     ):
+
         if cli:
             self._depcheck()
-        hostname = None
-        # Check if target is a hostname / Check IP
-        if ":" in target:
-            family = socket.AF_INET6
-            if not valid_ip6(target):
-                hostname = target
-            target = str(Net6(target))
-        else:
-            family = socket.AF_INET
-            if not valid_ip(target):
-                hostname = target
-            target = str(Net(target))
         assert UPN or ssp or guest, "Either UPN, ssp or guest must be provided !"
         # Do we need to build a SSP?
         if ssp is None:
             # Create the SSP (only if not guest mode)
             if not guest:
-                # Check UPN
-                try:
-                    _, realm = _parse_upn(UPN)
-                    if realm == ".":
-                        # Local
-                        kerberos = False
-                except ValueError:
-                    # not a UPN: NTLM
-                    kerberos = False
-                # Do we need to ask the password?
-                if HashNt is None and password is None and ST is None:
-                    # yes.
-                    from prompt_toolkit import prompt
-
-                    password = prompt("Password: ", is_password=True)
-                ssps = []
-                # Kerberos
-                if kerberos and hostname:
-                    if ST is None:
-                        resp = krb_as_and_tgs(
-                            upn=UPN,
-                            spn="cifs/%s" % hostname,
-                            password=password,
-                            debug=debug,
-                        )
-                        if resp is not None:
-                            ST, KEY = resp.tgsrep.ticket, resp.sessionkey
-                    if ST:
-                        ssps.append(KerberosSSP(UPN=UPN, ST=ST, KEY=KEY, debug=debug))
-                    elif kerberos_required:
-                        raise ValueError(
-                            "Kerberos required but target isn't a hostname !"
-                        )
-                elif kerberos_required:
-                    raise ValueError(
-                        "Kerberos required but domain not specified in the UPN, "
-                        "or target isn't a hostname !"
-                    )
-                # NTLM
-                if not kerberos_required:
-                    if HashNt is None and password is not None:
-                        HashNt = MD4le(password)
-                    ssps.append(NTLMSSP(UPN=UPN, HASHNT=HashNt))
-                # Build the SSP
-                ssp = SPNEGOSSP(ssps)
+                ssp = SPNEGOSSP.from_cli_arguments(
+                    UPN=UPN,
+                    target=target,
+                    password=password,
+                    HashNt=HashNt,
+                    HashAes256Sha96=HashAes256Sha96,
+                    HashAes128Sha96=HashAes128Sha96,
+                    ST=ST,
+                    KEY=KEY,
+                    kerberos_required=kerberos_required,
+                )
             else:
                 # Guest mode
                 ssp = None
@@ -497,17 +516,48 @@ class RegClient(CLIUtil):
         self.timeout = timeout
         self.client.verb = False
         try:
-            self.client.connect(target)
+            self.client.connect(target, timeout=self.timeout)
+            from time import sleep
+
+            sleep(1.5)
             self.client.open_smbpipe("winreg")
+            self.client.bind(self.interface)
+
         except ValueError as exc:
-            if "3221225644" in str(exc):
+            print(
+                f"[!] Warn: Remote service didn't seem to be running. Let's try again now that we should have trigger it. ({exc})"
+            )
+            from time import sleep
+
+            sleep(1.5)
+            self.client.open_smbpipe("winreg")
+            self.client.bind(self.interface)
+        except Scapy_Exception as e:
+            if str(3221225566) in str(e):
                 print(
-                    "[!] Warn: Remote service didn't seem to be running. Let's try again now that we should have trigger it."
+                    f"""
+    [!] STATUS_LOGON_FAILURE - {e}  You used:
+        - UPN {UPN},
+        - password {password},
+        - target {target},
+        - guest {guest},
+        - kerberos {kerberos},
+        - kerberos_required {kerberos_required},
+        - HashNt {HashNt},
+        - HashAes128Sha96 {HashAes128Sha96},
+        - HashAes256Sha96 {HashAes256Sha96},
+        - ST {ST},
+        - KEY {KEY}
+
+    [💡 TIPS] If you want to use a local account you may use something like: UPN = "WORKGROUP\\\\Administrator" or UPN = "Administrator@WORKGROUP" or "Administrator@192.168.1.2"
+"""
                 )
-                self.client.open_smbpipe("winreg")
-            else:
-                raise exc
-        self.client.bind(self.interface)
+                exit()
+        except TimeoutError as exc:
+            print(
+                f"[!] Timeout while connecting to {target}:{port}. Check service status. {exc}"
+            )
+
         self.cache: dict[str : dict[str, CacheElt]] = {
             "ls": dict(),
             "cat": dict(),
@@ -551,21 +601,24 @@ class RegClient(CLIUtil):
         """
         Selects and sets the base registry key (root) to use for subsequent operations.
 
-        Parameters:
-            root_path (str): The root registry path to use. Should start with one of the following:
-                - HKEY_CLASSES_ROOT
-                - HKEY_LOCAL_MACHINE
-                - HKEY_CURRENT_USER
-
         Behavior:
             - Determines which registry root to use based on the prefix of `root_path`.
             - Opens the corresponding registry root handle if not already opened, using the appropriate request.
-            - Sets `self.current_root_handle` and `self.current_root_path` to the selected root.
             - Clears the local subkey cache
             - Changes the current directory to the root of the selected registry hive.
+
+        :param root_path: The root registry path to use. Should start with one of the following:
+            - HKCROOT
+            - HKLM
+            - HKCU
+            - HKC
+            - HKU
+            - HKPERFDATA
+            - HKPERFTXT
+            - HKPERFNLSTXT
         """
 
-        default_read_access_rights = READ_ACCESS_RIGHTS
+        default_access_rights = AccessRights.KEY_READ
         root_path = RootKeys(root_path.upper().strip())
 
         match root_path:
@@ -576,7 +629,7 @@ class RegClient(CLIUtil):
                     self.client.sr1_req(
                         OpenClassesRoot_Request(
                             ServerName=None,
-                            samDesired=default_read_access_rights,
+                            samDesired=default_access_rights,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -590,7 +643,7 @@ class RegClient(CLIUtil):
                     self.client.sr1_req(
                         OpenCurrentUser_Request(
                             ServerName=None,
-                            samDesired=default_read_access_rights,
+                            samDesired=default_access_rights,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -604,7 +657,7 @@ class RegClient(CLIUtil):
                     self.client.sr1_req(
                         OpenLocalMachine_Request(
                             ServerName=None,
-                            samDesired=default_read_access_rights,
+                            samDesired=default_access_rights,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -618,7 +671,7 @@ class RegClient(CLIUtil):
                     self.client.sr1_req(
                         OpenCurrentConfig_Request(
                             ServerName=None,
-                            samDesired=default_read_access_rights,
+                            samDesired=default_access_rights,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -631,7 +684,7 @@ class RegClient(CLIUtil):
                     self.client.sr1_req(
                         OpenUsers_Request(
                             ServerName=None,
-                            samDesired=default_read_access_rights,
+                            samDesired=default_access_rights,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -644,7 +697,7 @@ class RegClient(CLIUtil):
                     self.client.sr1_req(
                         OpenPerformanceData_Request(
                             ServerName=None,
-                            samDesired=default_read_access_rights,
+                            samDesired=default_access_rights,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -657,7 +710,7 @@ class RegClient(CLIUtil):
                     self.client.sr1_req(
                         OpenPerformanceText_Request(
                             ServerName=None,
-                            samDesired=default_read_access_rights,
+                            samDesired=default_access_rights,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -670,7 +723,7 @@ class RegClient(CLIUtil):
                     self.client.sr1_req(
                         OpenPerformanceNlsText_Request(
                             ServerName=None,
-                            samDesired=default_read_access_rights,
+                            samDesired=default_access_rights,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -705,12 +758,12 @@ class RegClient(CLIUtil):
     #                   List and Cat
     # --------------------------------------------- #
     @CLIUtil.addcommand(spaces=True)
-    def ls(self, folder: Optional[str] = None) -> list[str]:
+    def ls(self, subkey: str | None = None) -> list[str]:
         """
         EnumKeys of the current subkey path
         """
 
-        res = self._get_cached_elt(folder=folder, cache_name="ls")
+        res = self._get_cached_elt(subkey=subkey, cache_name="ls")
         if res is None:
             return []
         elif len(res.values) != 0:
@@ -718,10 +771,10 @@ class RegClient(CLIUtil):
             # no need to query again the RPC
             return res.values
 
-        if folder is None:
-            folder = ""
+        if subkey is None:
+            subkey = ""
 
-        subkey_path = self._join_path(self.current_subkey_path, folder)
+        subkey_path = self._join_path(self.current_subkey_path, subkey)
 
         idx = 0
         while True:
@@ -760,28 +813,36 @@ class RegClient(CLIUtil):
             print(subkey)
 
     @CLIUtil.addcomplete(ls)
-    def ls_complete(self, folder: str) -> list[str]:
+    def ls_complete(self, subkey: str) -> list[str]:
         """
         Auto-complete ls
         """
         if self._require_root_handles(silent=True):
             return []
+
+        subkey = subkey.strip().replace("/", "\\")
+        if "\\" in subkey:
+            parent = "\\".join(subkey.split("\\")[:-1])
+            subkey = subkey.split("\\")[-1]
+        else:
+            parent = ""
+
         return [
-            str(subk)
-            for subk in self.ls()
-            if str(subk).lower().startswith(folder.lower())
+            str(self._join_path(parent, str(subk)))
+            for subk in self.ls(parent)
+            if str(subk).lower().startswith(subkey.lower())
         ]
 
     @CLIUtil.addcommand(spaces=True)
-    def cat(self, folder: Optional[str] = None) -> list[tuple[str, str]]:
+    def cat(self, subkey: str | None = None) -> list[tuple[str, str]]:
         """
         Enumerates and retrieves registry values for a given subkey path.
 
-        If no folder is specified, uses the current subkey path and caches results to avoid redundant RPC queries.
-        Otherwise, enumerates values under the specified folder path.
+        If no subkey is specified, uses the current subkey path and caches results to avoid redundant RPC queries.
+        Otherwise, enumerates values under the specified subkey path.
 
         Args:
-            folder (Optional[str]): The subkey path to enumerate. If None or empty, uses the current subkey path.
+            subkey (str | None): The subkey path to enumerate. If None or empty, uses the current subkey path.
 
         Returns:
             list[tuple[str, str]]: A list of registry entries (as RegEntry objects) for the specified subkey path.
@@ -791,7 +852,7 @@ class RegClient(CLIUtil):
             - May print error messages to standard output if RPC queries fail.
             - Updates internal cache for previously enumerated subkey paths.
         """
-        res = self._get_cached_elt(folder=folder, cache_name="cat")
+        res = self._get_cached_elt(subkey=subkey, cache_name="cat")
         if res is None:
             return []
         elif len(res.values) != 0:
@@ -799,7 +860,7 @@ class RegClient(CLIUtil):
             # no need to query again the RPC
             return res.values
 
-        subkey_path = self._join_path(self.current_subkey_path, folder)
+        subkey_path = self._join_path(self.current_subkey_path, subkey)
 
         idx = 0
         while True:
@@ -892,17 +953,11 @@ class RegClient(CLIUtil):
             )
 
     @CLIUtil.addcomplete(cat)
-    def cat_complete(self, folder: str) -> list[str]:
+    def cat_complete(self, subkey: str) -> list[str]:
         """
         Auto-complete cat
         """
-        if self._require_root_handles(silent=True):
-            return []
-        return [
-            str(subk)
-            for subk in self.ls()
-            if str(subk).lower().startswith(folder.lower())
-        ]
+        return self.ls_complete(subkey)
 
     # --------------------------------------------- #
     #                   Change Directory
@@ -920,7 +975,7 @@ class RegClient(CLIUtil):
 
         else:
             res = self._get_cached_elt(
-                folder=subkey,
+                subkey=subkey,
                 cache_name="cd",
             )
             tmp_handle = res.handle if res else None
@@ -933,29 +988,23 @@ class RegClient(CLIUtil):
             self.current_subkey_handle = tmp_handle
 
     @CLIUtil.addcomplete(cd)
-    def cd_complete(self, folder: str) -> list[str]:
+    def cd_complete(self, subkey: str) -> list[str]:
         """
         Auto-complete cd
         """
-        if self._require_root_handles(silent=True):
-            return []
-        return [
-            str(subk)
-            for subk in self.ls()
-            if str(subk).lower().startswith(folder.lower())
-        ]
+        return self.ls_complete(subkey)
 
     # --------------------------------------------- #
     #                   Get Information
     # --------------------------------------------- #
 
     @CLIUtil.addcommand()
-    def get_sd(self, folder: Optional[str] = None) -> Optional[SECURITY_DESCRIPTOR]:
+    def get_sd(self, subkey: str | None = None) -> SECURITY_DESCRIPTOR | None:
         """
         Get the security descriptor of the current subkey. SACL are not retrieve at this point (TODO).
 
         """
-        handle = self._get_cached_elt(folder=folder)
+        handle = self._get_cached_elt(subkey=subkey)
         if handle is None:
             return None
 
@@ -984,20 +1033,36 @@ class RegClient(CLIUtil):
 
         results = resp.pRpcSecurityDescriptorOut.valueof("lpSecurityDescriptor")
         sd = SECURITY_DESCRIPTOR(results)
-        print("Owner:", sd.OwnerSid.summary())
-        print("Group:", sd.GroupSid.summary())
-        if getattr(sd, "DACL", None):
-            print("DACL:")
-            for ace in sd.DACL.Aces:
-                print(" - ", ace.toSDDL())
         return sd
 
+    @CLIUtil.addoutput(get_sd)
+    def get_sd_output(self, sd: SECURITY_DESCRIPTOR | None) -> None:
+        """
+        Print the output of 'get_sd'
+        """
+        if sd is None:
+            print("No security descriptor found.")
+            return
+        else:
+            print("Owner:", sd.OwnerSid.summary())
+            print("Group:", sd.GroupSid.summary())
+            if getattr(sd, "DACL", None):
+                print("DACL:")
+                for ace in sd.DACL.Aces:
+                    print(" - ", ace.toSDDL())
+
     @CLIUtil.addcommand()
-    def query_info(self, folder: Optional[str] = None) -> None:
+    def query_info(
+        self, subkey: str | None = None
+    ) -> BaseRegQueryInfoKey_Response | None:
         """
         Query information on the current subkey
+
+        :param subkey: The subkey to query. If None, it uses the current subkey path.
+        :return: BaseRegQueryInfoKey_Response object containing information about the subkey.
+                 Returns None if the handle is invalid or an error occurs during the query.
         """
-        handle = self._get_cached_elt(folder)
+        handle = self._get_cached_elt(subkey)
         if handle is None:
             logger.error("Could not get handle on the specified subkey.")
             return None
@@ -1012,27 +1077,91 @@ class RegClient(CLIUtil):
         if not is_status_ok(resp.status):
             logger.error("Got status %s while querying info", hex(resp.status))
             return None
+        return resp
+
+    @CLIUtil.addoutput(query_info)
+    def query_info_output(self, info: None) -> None:
+        """
+        Print the output of 'query_info'
+        """
+        if info is None:
+            print("No information found.")
+            return
 
         print(
             f"""
-Info on key: {self.current_subkey_path}
-  - Number of subkeys: {resp.lpcSubKeys}
-  - Length of the longuest subkey name (in bytes): {resp.lpcbMaxSubKeyLen}
-  - Number of values: {resp.lpcValues}
-  - Length of the longest value name (in bytes): {resp.lpcbMaxValueNameLen}
-  - Last write time: {from_filetime_to_datetime(resp.lpftLastWriteTime)}
+Info on key:
+  - Number of subkeys: {info.lpcSubKeys}
+  - Length of the longest subkey name (in bytes): {info.lpcbMaxSubKeyLen}
+  - Number of values: {info.lpcValues}
+  - Length of the longest value name (in bytes): {info.lpcbMaxValueNameLen}
+  - Last write time: {from_filetime_to_datetime(info.lpftLastWriteTime)}
 """
         )
 
     @CLIUtil.addcommand()
-    def version(self):
+    def version(self) -> NDRIntField:
         """
         Get remote registry server version
         """
-        version = self.client.sr1_req(
+        return self.client.sr1_req(
             BaseRegGetVersion_Request(hKey=self.current_root_handle)
         ).lpdwVersion
+
+    @CLIUtil.addoutput(version)
+    def version_output(self, version: int) -> None:
+        """
+        Print the output of 'version'
+        """
         print(f"Remote registry server version: {version}")
+
+    # --------------------------------------------- #
+    #                  Modify                       #
+    # --------------------------------------------- #
+
+    @CLIUtil.addcommand()
+    def set_value(
+        self,
+        value_name: str,
+        value_type: RegType | str,
+        value_data: str,
+        subkey: str | None = None,
+    ) -> None:
+        """
+        Set a registry value in the current subkey.
+        If no subkey is specified, it uses the current subkey path.
+        """
+        try:
+            value_type = RegType.fromvalue(value_type)
+        except ValueError:
+            logger.error("Unknown registry type: %s", value_type)
+            return None
+
+        data = RegEntry.encode_data(value_type, value_data)
+
+        handle = self._get_cached_elt(
+            subkey=subkey, desired_access=AccessRights.KEY_WRITE
+        )
+        if handle is None:
+            logger.error("Could not get handle on the specified subkey.")
+            return None
+
+        req = BaseRegSetValue_Request(
+            hKey=handle,
+            lpValueName=RPC_UNICODE_STRING(Buffer=value_name),
+            dwType=value_type.value,
+            lpData=NDRPointer(
+                value=NDRConformantArray(value=NDRVaryingArray(value=data))
+            ),
+            ndr64=True,
+        )
+
+        resp = self.client.sr1_req(req)
+        if not is_status_ok(resp.status):
+            logger.error("Got status %s while setting value", hex(resp.status))
+            return None
+
+        breakpoint()
 
     # --------------------------------------------- #
     #                   Backup and Restore
@@ -1040,16 +1169,24 @@ Info on key: {self.current_subkey_path}
 
     @CLIUtil.addcommand()
     def save(
-        self, folder: Optional[str] = None, output_path: Optional[str] = None
+        self,
+        output_path: str | None = None,
+        subkey: str | None = None,
+        fsecurity: bool = False,
     ) -> None:
         """
-        Backup the current subkey to a file.
-        If no folder is specified, it uses the current subkey path.
+        Backup the current subkey to a file. If no subkey is specified, it uses the current subkey path. If no output_path is specified,
+        it will be saved in the `%WINDIR%\\System32` directory with the name of the subkey and .reg extension.
+
+        :param output_path: The path to save the backup file. If None, it defaults to the current subkey name with .reg extension.
+                            If the output path ends with .reg, it uses it as is, otherwise it appends .reg to the output path.
+        :param subkey: The subkey to backup. If None, it uses the current subkey path.
+        :return: None, by default it saves the backup to a file protected so that only BA can read it.
         """
         self.activate_backup()
-        handle = self._get_cached_elt(folder=folder)
+        handle = self._get_cached_elt(subkey=subkey)
         key_to_save = (
-            folder.split("\\")[-1] if folder else self.current_subkey_path.name
+            subkey.split("\\")[-1] if subkey else self.current_subkey_path.name
         )
 
         if handle is None:
@@ -1062,20 +1199,27 @@ Info on key: {self.current_subkey_path}
 
         elif output_path.endswith(".reg"):
             # If the output path ends with .reg, we use it as is
-            output_path = output_path.strip()
+            output_path = str(self._join_path("", output_path))
 
         else:
             # Otherwise, we use the current subkey path as the output path
             output_path = str(self._join_path(output_path, str(key_to_save) + ".reg"))
 
-        print(f"Backing up {key_to_save} to {output_path}")
+        if fsecurity:
+            print(
+                "Looks like you don't like security so much. Hope you know what you are doing."
+            )
+            sa = None
+        else:
+            sa = PRPC_SECURITY_ATTRIBUTES(
+                RpcSecurityDescriptor=RPC_SECURITY_DESCRIPTOR(
+                    lpSecurityDescriptor=DEFAULT_SECURITY_DESCRIPTOR,
+                ),
+                bInheritHandle=False,
+                ndr64=True,
+            )
 
-        sa = PRPC_SECURITY_ATTRIBUTES(
-            RpcSecurityDescriptor=RPC_SECURITY_DESCRIPTOR(
-                lpSecurityDescriptor=DEFAULT_SECURITY_DESCRIPTOR,
-            ),
-            ndr64=True,
-        )
+            sa.nLength = len(sa)
         req = BaseRegSaveKey_Request(
             hKey=handle,
             lpFile=RPC_UNICODE_STRING(Buffer=output_path),
@@ -1083,18 +1227,16 @@ Info on key: {self.current_subkey_path}
             ndr64=True,
         )
 
-        # If the security attributes are not provided, the default security descriptor is used.
-        # Meanning the file will inherite the access rights of the its parent directory.
-        req.show2()
         resp = self.client.sr1_req(req)
-        resp.show()
         if not is_status_ok(resp.status):
             logger.error("Got status %s while backing up", hex(resp.status))
-            return None
-
-        print(
-            f"Backup of {self.current_subkey_path} saved to {self.current_subkey_path}.reg"
-        )
+        else:
+            logger.info(
+                "Backup of %s saved to %s.reg successful ",
+                self.current_subkey_path,
+                output_path,
+            )
+            print(f"Backup of {self.current_subkey_path} saved to {output_path}")
 
     # --------------------------------------------- #
     #                   Operation options
@@ -1129,7 +1271,8 @@ Info on key: {self.current_subkey_path}
         print("Backup option deactivated.")
         self._clear_all_caches()
 
-    def switch_volatile(self) -> None:
+    @CLIUtil.addcommand()
+    def activate_volatile(self) -> None:
         """
         Set the registry operations to be volatile.
         This means that the registry key will be deleted when the system is restarted.
@@ -1140,6 +1283,7 @@ Info on key: {self.current_subkey_path}
 
         self._clear_all_caches()
 
+    @CLIUtil.addcommand()
     def disable_volatile(self) -> None:
         """
         Disable the volatile option for the registry operations.
@@ -1157,10 +1301,15 @@ Info on key: {self.current_subkey_path}
     def get_handle_on_subkey(
         self,
         subkey_path: PureWindowsPath,
-        desired_access_rights: Optional[IntFlag] = None,
-    ) -> Optional[NDRContextHandle]:
+        desired_access_rights: IntFlag | None = None,
+    ) -> NDRContextHandle | None:
         """
-        Ask the remote server to return an handle on a given subkey
+        Ask the remote server to return an handle on a given subkey.
+        If no access rights are specified, it defaults to read access rights.
+
+        :param subkey_path: The subkey path to get a handle on.
+        :param desired_access_rights: The desired access rights for the subkey. If None, defaults to read access rights.
+        :return: An NDRContextHandle on success, None on failure.
         """
         # If we don't have a root handle, we cannot get a subkey handle
         # This is a safety check, as we should not be able to call this function
@@ -1175,11 +1324,7 @@ Info on key: {self.current_subkey_path}
         # If no access rights were specified, we use the default read access rights
         if desired_access_rights is None:
             # Default to read access rights
-            desired_access_rights = (
-                AccessRights.KEY_QUERY_VALUE
-                | AccessRights.KEY_ENUMERATE_SUB_KEYS
-                | AccessRights.STANDARD_RIGHTS_READ
-            )
+            desired_access_rights = AccessRights.KEY_READ
 
         logger.debug(
             "Getting handle on subkey: %s with access rights: %s",
@@ -1205,29 +1350,36 @@ Info on key: {self.current_subkey_path}
 
     def _get_cached_elt(
         self,
-        folder: Optional[str] = None,
+        subkey: str | None = None,
         cache_name: str = None,
-        desired_access: Optional[IntFlag] = None,
-    ) -> Optional[NDRContextHandle | CacheElt]:
+        desired_access: IntFlag | None = None,
+    ) -> NDRContextHandle | CacheElt | None:
         """
-        Get the handle on the current subkey or the specified folder.
-        If no folder is specified, it uses the current subkey path.
+        Get a cached element for the specified subkey.
+
+        If the element is not cached, it retrieves the handle on the subkey
+        and caches it for future use.
+
+        :param subkey: The subkey path to retrieve. If None, uses the current subkey path.
+        :param cache_name: The name of the cache to use. If None, does not use cache.
+        :param desired_access: The desired access rights for the subkey. If None, defaults to read access rights.
+        :return: A CacheElt object if cache_name is provided, otherwise an NDRContextHandle.
         """
         if self._require_root_handles(silent=True):
             return None
 
         if desired_access is None:
             # Default to read access rights
-            desired_access = READ_ACCESS_RIGHTS
+            desired_access = AccessRights.KEY_READ
 
-        # If no specific folder was specified
+        # If no specific subkey was specified
         # we use our current subkey path
-        if folder is None or folder == "" or folder == ".":
+        if subkey is None or subkey == "" or subkey == ".":
             subkey_path = self.current_subkey_path
-        # Otherwise we use the folder path,
+        # Otherwise we use the subkey path,
         # the calling parent shall make sure that this path was properly sanitized
         else:
-            subkey_path = self._join_path(self.current_subkey_path, folder)
+            subkey_path = self._join_path(self.current_subkey_path, subkey)
 
         if (
             self.cache.get(cache_name, None) is not None
@@ -1238,6 +1390,7 @@ Info on key: {self.current_subkey_path}
             # If the access rights are the same, we return the cached elt
             return self.cache[cache_name][subkey_path]
 
+        # Otherwise, we need to get a new handle on the subkey
         handle = self.get_handle_on_subkey(subkey_path, desired_access)
         if handle is None:
             logger.error("Could not get handle on %s", subkey_path)
@@ -1250,6 +1403,15 @@ Info on key: {self.current_subkey_path}
         return cache_elt if cache_name is not None else handle
 
     def _join_path(self, first_path: str, second_path: str) -> PureWindowsPath:
+        """
+        Join two paths in a way that is compatible with Windows paths.
+        This ensures that the paths are normalized and combined correctly,
+        even if they are provided as strings or PureWindowsPath objects.
+
+        :param first_path: The first path to join.
+        :param second_path: The second path to join.
+        :return: A PureWindowsPath object representing the combined path.
+        """
         return PureWindowsPath(
             os.path.normpath(
                 os.path.join(
@@ -1260,6 +1422,12 @@ Info on key: {self.current_subkey_path}
         )
 
     def _require_root_handles(self, silent: bool = False) -> bool:
+        """
+        Check if we have a root handle set.
+
+        :param silent: If True, do not print any message if no root handle is set.
+        :return: True if no root handle is set, False otherwise.
+        """
         if self.current_root_handle is None:
             if not silent:
                 print("No root key selected ! Use 'use' to use one.")
@@ -1270,8 +1438,8 @@ Info on key: {self.current_subkey_path}
         """
         Clear all caches
         """
-        for key in self.cache.keys():
-            self.cache[key].clear()
+        for _, c in self.cache.items():
+            c.clear()
 
     @CLIUtil.addcommand()
     def dev(self) -> NoReturn:
