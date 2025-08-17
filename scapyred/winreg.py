@@ -8,6 +8,7 @@ import logging
 
 from enum import IntEnum, IntFlag, StrEnum, Enum
 from ctypes.wintypes import PFILETIME
+from re import sub
 from typing import NoReturn
 from pathlib import PureWindowsPath
 
@@ -17,7 +18,11 @@ from scapy.utils import (
 )
 
 from scapy.layers.msrpce.rpcclient import DCERPC_Client
-from scapy.layers.dcerpc import find_dcerpc_interface, DCERPC_Transport
+from scapy.layers.dcerpc import (
+    find_dcerpc_interface,
+    DCERPC_Transport,
+    NDRConformantString,
+)
 from scapy.layers.spnego import SPNEGOSSP
 from scapy.layers.smb2 import (
     SECURITY_DESCRIPTOR,
@@ -62,8 +67,8 @@ from scapy.layers.msrpce.raw.ms_rrp import (
     PRPC_SECURITY_DESCRIPTOR,
     PRPC_SECURITY_ATTRIBUTES,
     RPC_SECURITY_DESCRIPTOR,
-    NDRContextHandle,
     RPC_UNICODE_STRING,
+    NDRContextHandle,
     NDRIntField,
 )
 
@@ -202,6 +207,33 @@ class RootKeys(StrEnum):
         obj._value_ = normalized
         return obj
 
+    @classmethod
+    def from_value(cls, value: str):
+        """Convert a string to a RootKeys enum member."""
+        value = value.strip().upper()
+        match value:
+            case "HKEY_CLASSES_ROOT":
+                value = RootKeys.HKEY_CLASSES_ROOT.value
+            case "HKEY_CURRENT_USER":
+                value = RootKeys.HKEY_CURRENT_USER.value
+            case "HKEY_LOCAL_MACHINE":
+                value = RootKeys.HKEY_LOCAL_MACHINE.value
+            case "HKEY_CURRENT_CONFIG":
+                value = RootKeys.HKEY_CURRENT_CONFIG.value
+            case "HKEY_USERS":
+                value = RootKeys.HKEY_USERS.value
+            case "HKEY_PERFORMANCE_DATA":
+                value = RootKeys.HKEY_PERFORMANCE_DATA.value
+            case "HKEY_PERFORMANCE_TEXT":
+                value = RootKeys.HKEY_PERFORMANCE_TEXT.value
+            case "HKEY_PERFORMANCE_NLSTEXT":
+                value = RootKeys.HKEY_PERFORMANCE_NLSTEXT.value
+
+        try:
+            return cls(value)
+        except ValueError:
+            print(f"Unknown root key: {value}.")
+
 
 class RegType(IntEnum):
     """
@@ -232,15 +264,15 @@ class RegType(IntEnum):
         :return: The corresponding RegType enum member.
         """
         if isinstance(value, int):
-            breakpoint()
             try:
                 return cls(value)
             except ValueError:
                 print(f"Unknown registry type: {value}, using UNK")
+                return cls.UNK
 
         value = value.strip().upper()
         try:
-            return cls[int(value)]
+            return cls(int(value))
         except (ValueError, KeyError):
             print(f"Unknown registry type: {value}, using UNK")
         return cls.UNK
@@ -350,7 +382,7 @@ class RegEntry:
             case RegType.REG_MULTI_SZ | RegType.REG_SZ | RegType.REG_EXPAND_SZ:
                 if self.reg_type == RegType.REG_MULTI_SZ:
                     # decode multiple null terminated strings
-                    self.reg_data = reg_data.decode("utf-16le")[:-2].replace(
+                    self.reg_data = reg_data.decode("utf-16le")[:-1].replace(
                         "\x00", "\n"
                     )
                 else:
@@ -380,12 +412,12 @@ class RegEntry:
             case RegType.REG_MULTI_SZ | RegType.REG_SZ | RegType.REG_EXPAND_SZ:
                 if reg_type == RegType.REG_MULTI_SZ:
                     # decode multiple null terminated strings
-                    return data.replace("\n", "\x00").encode("utf-16le") + b"\x00\x00"
+                    return data.replace("\\n", "\x00").encode("utf-16le") + b"\x00\x00"
                 else:
-                    return data.decode("utf-16le")
+                    return data.encode("utf-16le")
 
             case RegType.REG_BINARY:
-                return data
+                return data.encode("utf-8").decode("unicode_escape").encode("latin1")
 
             case RegType.REG_DWORD | RegType.REG_QWORD:
                 bit_length = (int(data).bit_length() + 7) // 8
@@ -399,7 +431,7 @@ class RegEntry:
                 return data.encode("utf-16le")
 
             case _:
-                return data.encode("utf-8")
+                return data.encode("utf-8").decode("unicode_escape").encode("latin1")
 
     def __str__(self) -> str:
         return f"{self.reg_value} ({self.reg_type.name}) {self.reg_data}"
@@ -949,7 +981,7 @@ class RegClient(CLIUtil):
 
         for entry in results:
             print(
-                f"  - {entry.reg_value:<20} {'(' + entry.reg_type.name + ')':<15} {entry.reg_data}"
+                f"  - {entry.reg_value:<20} {'(' + entry.reg_type.name + " - " + str(entry.reg_type.value) + ')':<15} {entry.reg_data}"
             )
 
     @CLIUtil.addcomplete(cat)
@@ -1145,23 +1177,27 @@ Info on key:
         if handle is None:
             logger.error("Could not get handle on the specified subkey.")
             return None
-
         req = BaseRegSetValue_Request(
             hKey=handle,
-            lpValueName=RPC_UNICODE_STRING(Buffer=value_name),
+            lpValueName=RPC_UNICODE_STRING(Buffer=value_name + "\x00"),
             dwType=value_type.value,
-            lpData=NDRPointer(
-                value=NDRConformantArray(value=NDRVaryingArray(value=data))
-            ),
+            lpData=data,
             ndr64=True,
         )
 
         resp = self.client.sr1_req(req)
+        # We remove the entry from the cache if it exists
+        # Even if the response status is not OK, we want to remove it
+        if subkey is None:
+            subkey_path = self.current_subkey_path
+        else:
+            subkey_path = self._join_path(self.current_subkey_path, subkey)
+        if subkey_path in self.cache["cat"]:
+            self.cache["cat"].pop(subkey_path, None)
+
         if not is_status_ok(resp.status):
             logger.error("Got status %s while setting value", hex(resp.status))
             return None
-
-        breakpoint()
 
     # --------------------------------------------- #
     #                   Backup and Restore
