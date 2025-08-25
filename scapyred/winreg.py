@@ -1,16 +1,24 @@
 """
-DCE/RPC client
+Wrapper for the Windows Registry (winreg) using DCERPC
+This module provides a client for interacting with the Windows Registry over DCERPC.
+It allows for operations such as opening keys, enumerating subkeys and values, querying values,
+setting values, and deleting keys or values.
+
+The client supports authentication via NTLM or Kerberos, and can operate in a CLI mode.
+It also provides utility functions for handling registry data types and error codes.
+It is designed to be used with Scapy's DCERPC framework.
 """
 
 from dataclasses import dataclass
 import os
 import logging
+import sys
 
 from enum import IntEnum, IntFlag, StrEnum, Enum
 from ctypes.wintypes import PFILETIME
-from re import sub
 from typing import NoReturn
 from pathlib import PureWindowsPath
+from time import sleep
 
 from scapy.themes import DefaultTheme
 from scapy.utils import (
@@ -21,7 +29,6 @@ from scapy.layers.msrpce.rpcclient import DCERPC_Client
 from scapy.layers.dcerpc import (
     find_dcerpc_interface,
     DCERPC_Transport,
-    NDRConformantString,
 )
 from scapy.layers.spnego import SPNEGOSSP
 from scapy.layers.smb2 import (
@@ -64,6 +71,9 @@ from scapy.layers.msrpce.raw.ms_rrp import (
     BaseRegGetKeySecurity_Request,
     BaseRegSaveKey_Request,
     BaseRegSetValue_Request,
+    BaseRegCreateKey_Request,
+    BaseRegDeleteKey_Request,
+    BaseRegDeleteValue_Request,
     PRPC_SECURITY_DESCRIPTOR,
     PRPC_SECURITY_ATTRIBUTES,
     RPC_SECURITY_DESCRIPTOR,
@@ -83,32 +93,132 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class AccessRights(IntFlag):
+class GenericAccessRights(IntFlag):
     """
-    Access rights for registry keys
+    Generic access rights:
+    https://learn.microsoft.com/en-us/windows/win32/secauthz/generic-access-rights
     """
 
-    # Access rights for registry keys
-    # These constants are used to specify the access rights when opening or creating registry keys.
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    GENERIC_EXECUTE = 0x20000000
+    GENERIC_ALL = 0x10000000
+    MAXIMUM_ALLOWED = 0x02000000
+    ACCESS_SACL = 0x01000000
+
+
+class StandardAccessRights(IntFlag):
+    """
+    Standard access rights:
+    https://learn.microsoft.com/en-us/windows/win32/secauthz/standard-access-rights
+    """
+
+    DELETE = 0x00010000
+    READ_CONTROL = 0x00020000
+    WRITE_DAC = 0x00040000
+    WRITE_OWNER = 0x00080000
+    SYNCHRONIZE = 0x00100000
+
+    STANDARD_RIGHTS_REQUIRED = DELETE | READ_CONTROL | WRITE_DAC | WRITE_OWNER
+    STANDARD_RIGHTS_ALL = STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE
+
+    STANDARD_RIGHTS_READ = READ_CONTROL
+    STANDARD_RIGHTS_WRITE = READ_CONTROL
+    STANDARD_RIGHTS_EXECUTE = READ_CONTROL
+    SPECIFIC_RIGHTS_ALL = 0x0000FFFF
+
+
+class SpecificAccessRights(IntFlag):
+    """
+    Access rights for registry keys:
+    https://learn.microsoft.com/en-us/windows/win32/sysinfo/registry-key-security-and-access-rights
+    """
+
     KEY_QUERY_VALUE = 0x00000001
+    KEY_SET_VALUE = 0x00000002
+    KEY_CREATE_SUB_KEY = 0x00000004
     KEY_ENUMERATE_SUB_KEYS = 0x00000008
-    KEY_ALL_ACCESS = 0xF003F  # Combines the STANDARD_RIGHTS_REQUIRED, KEY_QUERY_VALUE, KEY_SET_VALUE, KEY_CREATE_SUB_KEY, KEY_ENUMERATE_SUB_KEYS, KEY_NOTIFY, and KEY_CREATE_LINK access rights.
-    STANDARD_RIGHTS_READ = 0x00020000
-    KEY_CREATE_LINK = 0x0020
-    KEY_NOTIFY = 0x0010
-    KEY_READ = 0x20019  # Combines the STANDARD_RIGHTS_READ, KEY_QUERY_VALUE, KEY_ENUMERATE_SUB_KEYS, and KEY_NOTIFY values.
-    KEY_EXECUTE = 0x20019  # Equivalent to KEY_READ.
-    KEY_CREATE_SUB_KEY = 0x0004  # Required to create a subkey of a registry key.
-    KEY_SET_VALUE = 0x0002  # Required to create, delete, or set a registry value.
-    KEY_WOW64_32KEY = 0x0200  # Indicates that an application on 64-bit Windows should operate on the 32-bit registry view.
-    # This flag is ignored by 32-bit Windows. For more information, see Accessing an Alternate Registry View.
-    # This flag must be combined using the OR operator with the other flags in this table that either query or access registry values.
-    # Windows 2000: This flag is not supported.
-    KEY_WOW64_64KEY = 0x0100  # Indicates that an application on 64-bit Windows should operate on the 64-bit registry view.
-    # This flag is ignored by 32-bit Windows. For more information, see Accessing an Alternate Registry View.
-    # This flag must be combined using the OR operator with the other flags in this table that either query or access registry values.
-    # Windows 2000: This flag is not supported.
-    KEY_WRITE = 0x20006  # Combines the STANDARD_RIGHTS_WRITE, KEY_SET_VALUE, and KEY_CREATE_SUB_KEY access rights.
+    KEY_NOTIFY = 0x00000010
+    KEY_CREATE_LINK = 0x00000020
+    KEY_WOW64_64KEY = 0x0100
+    KEY_WOW64_32KEY = 0x0200
+    KEY_READ = (
+        StandardAccessRights.STANDARD_RIGHTS_READ
+        | KEY_QUERY_VALUE
+        | KEY_ENUMERATE_SUB_KEYS
+        | KEY_NOTIFY
+    )
+    KEY_EXECUTE = KEY_READ
+
+
+class AccessRights(IntFlag):
+    """
+    Combines generic, standard, and specific access rights for registry keys.
+    """
+
+    # Generic
+    GENERIC_READ = GenericAccessRights.GENERIC_READ
+    GENERIC_WRITE = GenericAccessRights.GENERIC_WRITE
+    GENERIC_EXECUTE = GenericAccessRights.GENERIC_EXECUTE
+    GENERIC_ALL = GenericAccessRights.GENERIC_ALL
+    MAXIMUM_ALLOWED = GenericAccessRights.MAXIMUM_ALLOWED
+    ACCESS_SACL = GenericAccessRights.ACCESS_SACL
+
+    # Standard
+    DELETE = StandardAccessRights.DELETE
+    READ_CONTROL = StandardAccessRights.READ_CONTROL
+    WRITE_DAC = StandardAccessRights.WRITE_DAC
+    WRITE_OWNER = StandardAccessRights.WRITE_OWNER
+    SYNCHRONIZE = StandardAccessRights.SYNCHRONIZE
+    STANDARD_RIGHTS_REQUIRED = (
+        StandardAccessRights.DELETE
+        | StandardAccessRights.READ_CONTROL
+        | StandardAccessRights.WRITE_DAC
+        | StandardAccessRights.WRITE_OWNER
+    )
+    STANDARD_RIGHTS_READ = StandardAccessRights.READ_CONTROL
+    STANDARD_RIGHTS_WRITE = StandardAccessRights.READ_CONTROL
+    STANDARD_RIGHTS_EXECUTE = StandardAccessRights.READ_CONTROL
+    STANDARD_RIGHTS_ALL = (
+        StandardAccessRights.DELETE
+        | StandardAccessRights.READ_CONTROL
+        | StandardAccessRights.WRITE_DAC
+        | StandardAccessRights.WRITE_OWNER
+        | StandardAccessRights.SYNCHRONIZE
+    )
+    SPECIFIC_RIGHTS_ALL = StandardAccessRights.SPECIFIC_RIGHTS_ALL
+
+    # Specific
+    KEY_QUERY_VALUE = SpecificAccessRights.KEY_QUERY_VALUE
+    KEY_SET_VALUE = SpecificAccessRights.KEY_SET_VALUE
+    KEY_CREATE_SUB_KEY = SpecificAccessRights.KEY_CREATE_SUB_KEY
+    KEY_ENUMERATE_SUB_KEYS = SpecificAccessRights.KEY_ENUMERATE_SUB_KEYS
+    KEY_NOTIFY = SpecificAccessRights.KEY_NOTIFY
+    KEY_CREATE_LINK = SpecificAccessRights.KEY_CREATE_LINK
+    KEY_WOW64_64KEY = SpecificAccessRights.KEY_WOW64_64KEY
+    KEY_WOW64_32KEY = SpecificAccessRights.KEY_WOW64_32KEY
+
+    KEY_READ = (
+        StandardAccessRights.READ_CONTROL
+        | SpecificAccessRights.KEY_QUERY_VALUE
+        | SpecificAccessRights.KEY_ENUMERATE_SUB_KEYS
+        | SpecificAccessRights.KEY_NOTIFY
+    )
+    KEY_EXECUTE = KEY_READ
+    KEY_WRITE = (
+        STANDARD_RIGHTS_ALL
+        | SpecificAccessRights.KEY_SET_VALUE
+        | SpecificAccessRights.KEY_CREATE_SUB_KEY
+    )
+    KEY_ALL_ACCESS = (
+        STANDARD_RIGHTS_REQUIRED
+        | SpecificAccessRights.KEY_QUERY_VALUE
+        | SpecificAccessRights.KEY_SET_VALUE
+        | SpecificAccessRights.KEY_CREATE_SUB_KEY
+        | SpecificAccessRights.KEY_ENUMERATE_SUB_KEYS
+        | SpecificAccessRights.KEY_NOTIFY
+        | SpecificAccessRights.KEY_CREATE_LINK
+    )
 
 
 class RegOptions(IntFlag):
@@ -139,6 +249,7 @@ class ErrorCodes(IntEnum):
     ERROR_INVALID_PARAMETER = 0x00000057
     ERROR_CALL_NOT_IMPLEMENTED = 0x00000057
     ERROR_INVALID_NAME = 0x0000007B
+    ERROR_BAD_PATHNAME = 0x000000A1
     ERROR_ALREADY_EXISTS = 0x000000B7
     ERROR_NO_MORE_ITEMS = 0x00000103
     ERROR_NOACCESS = 0x000003E6
@@ -255,7 +366,17 @@ class RegType(IntEnum):
     @classmethod
     def _missing_(cls, value):
         print(f"Unknown registry type: {value}, using UNK")
-        return cls.UNK
+        unk = cls.UNK
+        unk.real_value = value
+        return unk
+
+    def __new__(cls, value, real_value=None):
+        obj = int.__new__(cls, value)
+        obj._value_ = value
+        if real_value is None:
+            real_value = value
+        obj.real_value = real_value
+        return obj
 
     @classmethod
     def fromvalue(cls, value: str | int) -> "RegType":
@@ -549,7 +670,6 @@ class RegClient(CLIUtil):
         self.client.verb = False
         try:
             self.client.connect(target, timeout=self.timeout)
-            from time import sleep
 
             sleep(1.5)
             self.client.open_smbpipe("winreg")
@@ -559,7 +679,6 @@ class RegClient(CLIUtil):
             print(
                 f"[!] Warn: Remote service didn't seem to be running. Let's try again now that we should have trigger it. ({exc})"
             )
-            from time import sleep
 
             sleep(1.5)
             self.client.open_smbpipe("winreg")
@@ -589,6 +708,7 @@ class RegClient(CLIUtil):
             print(
                 f"[!] Timeout while connecting to {target}:{port}. Check service status. {exc}"
             )
+            sys.exit(-1)
 
         self.cache: dict[str : dict[str, CacheElt]] = {
             "ls": dict(),
@@ -601,7 +721,9 @@ class RegClient(CLIUtil):
         self.root_handle = {}
         self.current_root_handle = None
         self.current_subkey_handle = None
+        self.exploration_mode = False
         self.current_subkey_path: PureWindowsPath = PureWindowsPath("")
+        self.sam_requested_access_rights = AccessRights.MAXIMUM_ALLOWED
         if rootKey in AVAILABLE_ROOT_KEYS:
             self.current_root_path = rootKey.strip()
             self.use(self.current_root_path)
@@ -616,7 +738,7 @@ class RegClient(CLIUtil):
         return f"[reg] {self.current_root_path}\\{self.current_subkey_path} > "
 
     @CLIUtil.addcommand()
-    def close(self) -> NoReturn:
+    def close(self) -> None:
         """
         Close all connections
         """
@@ -650,7 +772,6 @@ class RegClient(CLIUtil):
             - HKPERFNLSTXT
         """
 
-        default_access_rights = AccessRights.KEY_READ
         root_path = RootKeys(root_path.upper().strip())
 
         match root_path:
@@ -661,7 +782,7 @@ class RegClient(CLIUtil):
                     self.client.sr1_req(
                         OpenClassesRoot_Request(
                             ServerName=None,
-                            samDesired=default_access_rights,
+                            samDesired=self.sam_requested_access_rights,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -675,7 +796,7 @@ class RegClient(CLIUtil):
                     self.client.sr1_req(
                         OpenCurrentUser_Request(
                             ServerName=None,
-                            samDesired=default_access_rights,
+                            samDesired=self.sam_requested_access_rights,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -689,7 +810,7 @@ class RegClient(CLIUtil):
                     self.client.sr1_req(
                         OpenLocalMachine_Request(
                             ServerName=None,
-                            samDesired=default_access_rights,
+                            samDesired=self.sam_requested_access_rights,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -703,7 +824,7 @@ class RegClient(CLIUtil):
                     self.client.sr1_req(
                         OpenCurrentConfig_Request(
                             ServerName=None,
-                            samDesired=default_access_rights,
+                            samDesired=self.sam_requested_access_rights,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -716,7 +837,7 @@ class RegClient(CLIUtil):
                     self.client.sr1_req(
                         OpenUsers_Request(
                             ServerName=None,
-                            samDesired=default_access_rights,
+                            samDesired=self.sam_requested_access_rights,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -729,7 +850,7 @@ class RegClient(CLIUtil):
                     self.client.sr1_req(
                         OpenPerformanceData_Request(
                             ServerName=None,
-                            samDesired=default_access_rights,
+                            samDesired=self.sam_requested_access_rights,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -742,7 +863,7 @@ class RegClient(CLIUtil):
                     self.client.sr1_req(
                         OpenPerformanceText_Request(
                             ServerName=None,
-                            samDesired=default_access_rights,
+                            samDesired=self.sam_requested_access_rights,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -755,7 +876,7 @@ class RegClient(CLIUtil):
                     self.client.sr1_req(
                         OpenPerformanceNlsText_Request(
                             ServerName=None,
-                            samDesired=default_access_rights,
+                            samDesired=self.sam_requested_access_rights,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -789,6 +910,7 @@ class RegClient(CLIUtil):
     # --------------------------------------------- #
     #                   List and Cat
     # --------------------------------------------- #
+
     @CLIUtil.addcommand(spaces=True)
     def ls(self, subkey: str | None = None) -> list[str]:
         """
@@ -837,7 +959,7 @@ class RegClient(CLIUtil):
         return self.cache["ls"][subkey_path].values
 
     @CLIUtil.addoutput(ls)
-    def ls_output(self, results: list[str]) -> NoReturn:
+    def ls_output(self, results: list[str]) -> None:
         """
         Print the output of 'ls'
         """
@@ -980,6 +1102,10 @@ class RegClient(CLIUtil):
             return
 
         for entry in results:
+            if entry.reg_type == RegType.UNK:
+                print(
+                    f"  - {entry.reg_value:<20} {'(' + entry.reg_type.name + " - " + str(entry.reg_type.real_value) + ')':<15} {entry.reg_data}"
+                )
             print(
                 f"  - {entry.reg_value:<20} {'(' + entry.reg_type.name + " - " + str(entry.reg_type.value) + ')':<15} {entry.reg_data}"
             )
@@ -1019,12 +1145,44 @@ class RegClient(CLIUtil):
             self.current_subkey_path = tmp_path
             self.current_subkey_handle = tmp_handle
 
+        if self.exploration_mode:
+            # force the trigger of the UTILS.OUTPUT command (cd_output)
+            return f"[{self.current_root_path}:\\{self.current_subkey_path}]"
+
     @CLIUtil.addcomplete(cd)
     def cd_complete(self, subkey: str) -> list[str]:
         """
         Auto-complete cd
         """
         return self.ls_complete(subkey)
+
+    @CLIUtil.addoutput(cd)
+    def cd_output(self, pwd) -> None:
+        """
+        Print the output of 'cd'
+        """
+        if self.exploration_mode:
+            print(pwd)
+            print("-" * 10 + " SubKeys" + "-" * 10)
+            self.ls_output(self.ls())
+            print("-" * 10 + " Values" + "-" * 10)
+            self.cat_output(self.cat())
+
+    @CLIUtil.addcommand()
+    def activate_exploration_mode(self) -> None:
+        """
+        Activate exploration mode: perform ls and cat automatically when changing directory
+        """
+        self.exploration_mode = True
+        print("Exploration mode activated")
+
+    @CLIUtil.addcommand()
+    def disable_exploration_mode(self) -> None:
+        """
+        Disable exploration mode
+        """
+        self.exploration_mode = False
+        print("Exploration mode disabled")
 
     # --------------------------------------------- #
     #                   Get Information
@@ -1199,6 +1357,101 @@ Info on key:
             logger.error("Got status %s while setting value", hex(resp.status))
             return None
 
+    @CLIUtil.addcommand()
+    def create_key(
+        self, new_key: str, root_key: str | None, subkey: str | None = None
+    ) -> None:
+        req = BaseRegCreateKey_Request(
+            hKey=self.current_subkey_handle,
+            lpSubKey=RPC_UNICODE_STRING(Buffer=new_key + "\x00"),
+            samDesired=self.sam_requested_access_rights,
+            dwOptions=self.extra_options,
+            lpClass=None,
+            lpSecurityAttributes=None,
+        )
+        resp = self.client.sr1_req(req)
+        if not is_status_ok(resp.status):
+            logger.error("Got status %s while creating key", hex(resp.status))
+            return None
+        print(f"Key {new_key} created successfully.")
+
+    @CLIUtil.addcommand()
+    def delete_key(self, subkey: str | None = None) -> None:
+        """
+        Delete the specified subkey. If no subkey is specified, it uses the current subkey path.
+        Proper same access rights are required to delete a key. By default we request MAXIMUM_ALLOWED.
+        So no issue.
+
+        :param subkey: The subkey to delete. If None, it uses the current subkey path.
+        """
+        self.activate_backup()
+        if subkey is None:
+            subkey_path = self.current_subkey_path
+        else:
+            subkey_path = self._join_path(self.current_subkey_path, subkey)
+
+        req = BaseRegDeleteKey_Request(
+            hKey=self.current_root_handle,
+            lpSubKey=RPC_UNICODE_STRING(Buffer=str(subkey_path) + "\x00"),
+            ndr64=True,
+        )
+
+        resp = self.client.sr1_req(req)
+        # We remove the entry from the cache if it exists
+        # Even if the response status is not OK, we want to remove it
+
+        if subkey_path in self.cache["ls"]:
+            self.cache["ls"].pop(subkey_path, None)
+        if subkey_path in self.cache["cat"]:
+            self.cache["cat"].pop(subkey_path, None)
+
+        if not is_status_ok(resp.status):
+            logger.error("Got status %s while deleting key", hex(resp.status))
+            return None
+
+        print(f"Key {subkey} deleted successfully.")
+
+    @CLIUtil.addcommand()
+    def delete_value(self, value: str = "", subkey: str | None = None) -> None:
+        """
+        Delete the specified value.
+        If no subkey is specified, it uses the current subkey path.
+        If no value is specified, it will delete the default value of the subkey, but subkey cannot be specified.
+
+        :param subkey: The subkey to delete. If None, it uses the current subkey path.
+        """
+        self.activate_backup()
+        handle = self._get_cached_elt(
+            subkey=subkey, desired_access=AccessRights.KEY_WRITE
+        )
+        if handle is None:
+            logger.error("Could not get handle on the specified subkey.")
+            return None
+
+        req = BaseRegDeleteValue_Request(
+            hKey=handle,
+            lpValueName=RPC_UNICODE_STRING(Buffer=value + "\x00"),
+            ndr64=True,
+        )
+
+        resp = self.client.sr1_req(req)
+        # We remove the entry from the cache if it exists
+        # Even if the response status is not OK, we want to remove it
+        # We remove the entry from the cache if it exists
+        # Even if the response status is not OK, we want to remove it
+        if subkey is None:
+            subkey_path = self.current_subkey_path
+        else:
+            subkey_path = self._join_path(self.current_subkey_path, subkey)
+        if subkey_path in self.cache["cat"]:
+            self.cache["cat"].pop(subkey_path, None)
+
+        if not is_status_ok(resp.status):
+            logger.error("Got status %s while setting value", hex(resp.status))
+            return None
+
+        print(f"Key {subkey} deleted successfully.")
+
     # --------------------------------------------- #
     #                   Backup and Restore
     # --------------------------------------------- #
@@ -1315,6 +1568,7 @@ Info on key:
         """
         self.extra_options |= RegOptions.REG_OPTION_VOLATILE
         self.extra_options &= ~RegOptions.REG_OPTION_NON_VOLATILE
+        self.use(self.current_root_path)
         print("Volatile option activated.")
 
         self._clear_all_caches()
@@ -1327,6 +1581,7 @@ Info on key:
         """
         self.extra_options &= ~RegOptions.REG_OPTION_VOLATILE
         self.extra_options |= RegOptions.REG_OPTION_NON_VOLATILE
+        self.use(self.current_root_path)
         print("Volatile option deactivated.")
         self._clear_all_caches()
 
@@ -1438,7 +1693,9 @@ Info on key:
 
         return cache_elt if cache_name is not None else handle
 
-    def _join_path(self, first_path: str, second_path: str) -> PureWindowsPath:
+    def _join_path(
+        self, first_path: str | None, second_path: str | None
+    ) -> PureWindowsPath:
         """
         Join two paths in a way that is compatible with Windows paths.
         This ensures that the paths are normalized and combined correctly,
@@ -1448,6 +1705,15 @@ Info on key:
         :param second_path: The second path to join.
         :return: A PureWindowsPath object representing the combined path.
         """
+        if first_path is None:
+            first_path = ""
+        if second_path is None:
+            second_path = ""
+        if str(PureWindowsPath(second_path).as_posix()).startswith("/"):
+            # If the second path is an absolute path, we return it as is
+            return PureWindowsPath(
+                os.path.normpath(PureWindowsPath(second_path).as_posix()).lstrip("/")
+            )
         return PureWindowsPath(
             os.path.normpath(
                 os.path.join(
