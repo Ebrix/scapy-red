@@ -336,3 +336,25 @@ The ``delete_value`` function deletes a specified value under the current key or
           - string              (REG_EXPAND_SZ - 2) %APPDATA%UnicodeString
           - mydword             (REG_DWORD - 4) 12345
           - myBEdword           (REG_DWORD_BIG_ENDIAN - 5) 123451238412304
+
+
+================================================
+``activate_backup``: Activate backup privilege
+================================================
+
+The ``activate_backup`` function activates the SeBackupPrivilege on the current session.
+This privilege is required to perform certain operations, such as saving the registry to a file or most operations which modify the registry.
+If you get an "Access Denied" error while performing such operations, try activating the backup privilege first.
+
+You can disable it via ``disable_backup`` function.
+
+========================================================
+``activate_exploration_mode``: Activate exploration mode
+========================================================
+
+The ``activate_exploration_mode`` function activates the exploration mode on the current session.
+This mode is usefull when you want to explore the registry not knowing precisely what you are looking for.
+It just do an ```ls`` and a ``cat`` when you ``cd`` into a new subkey.
+This way you can quickly explore the registry without having to manually ``ls`` and ``cat`` each time.
+
+You can disable it via ``disable_exploration_mode`` function.
