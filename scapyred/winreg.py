@@ -9,11 +9,11 @@ It also provides utility functions for handling registry data types and error co
 It is designed to be used with Scapy's DCERPC framework.
 """
 
-from dataclasses import dataclass
 import os
 import logging
 import sys
 
+from dataclasses import dataclass
 from enum import IntEnum, IntFlag, StrEnum, Enum
 from ctypes.wintypes import PFILETIME
 from typing import NoReturn
@@ -86,7 +86,14 @@ from scapy.layers.msrpce.raw.ms_rrp import (
 # pylint: disable=logging-fstring-interpolation
 # Set log level to benefit from Scapy warnings
 logger = logging.getLogger("scapy")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
+
+# nique ta mere logger
+for handler in logger.handlers:
+    if isinstance(handler, logging.StreamHandler):
+        handler.setLevel(logging.DEBUG)  # Set desired level
+        break
+
 # Create a file handler
 file_handler = logging.FileHandler("winreg.log")
 file_handler.setLevel(logging.DEBUG)
@@ -99,7 +106,7 @@ file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
 
-logger.info("Starting scapy-windows-registry module")
+logger.debug("Starting scapy-windows-registry module")
 
 
 class GenericAccessRights(IntFlag):
@@ -271,6 +278,7 @@ class ErrorCodes(IntEnum):
         Return the string representation of the error code.
         :return: The string representation of the error code.
         """
+
         return self.name
 
 
@@ -393,6 +401,7 @@ class RegType(IntEnum):
         :param value: The string representation of the registry type.
         :return: The corresponding RegType enum member.
         """
+
         if isinstance(value, int):
             try:
                 return cls(value)
@@ -412,6 +421,7 @@ def from_filetime_to_datetime(lp_filetime: PFILETIME) -> str:
     """
     Convert a filetime to a human readable date
     """
+
     from datetime import datetime, timezone
 
     filetime = lp_filetime.dwLowDateTime + (lp_filetime.dwHighDateTime << 32)
@@ -428,6 +438,7 @@ def is_status_ok(status: int) -> bool:
     Check the error code and raise an exception if it is not successful.
     :param status: The error code to check.
     """
+
     try:
         err = ErrorCodes(status)
         if err not in [
@@ -435,13 +446,11 @@ def is_status_ok(status: int) -> bool:
             ErrorCodes.ERROR_NO_MORE_ITEMS,
             ErrorCodes.ERROR_MORE_DATA,
         ]:
-            print(f"[!] Error: {hex(err.value)} - {ErrorCodes(status).name}")
             logger.error("Error: %s - %s", hex(err.value), ErrorCodes(status).name)
             return False
         return True
     except ValueError as exc:
-        print(f"[!] Error: {hex(status)} - Unknown error code")
-        logger.error("Error: %s - %s", hex(err.value), ErrorCodes(status).name)
+        logger.error("Error: %s - Unknown error code", hex(status))
         raise ValueError(f"Error: {hex(status)} - Unknown error code") from exc
 
 
@@ -545,6 +554,7 @@ class RegEntry:
         """
         Encode data based on the type.
         """
+
         match reg_type:
             case RegType.REG_MULTI_SZ | RegType.REG_SZ | RegType.REG_EXPAND_SZ:
                 if reg_type == RegType.REG_MULTI_SZ:
@@ -801,6 +811,7 @@ class RegClient(CLIUtil):
         match root_path:
             case RootKeys.HKEY_CLASSES_ROOT:
                 # Change to HKCR root
+                logger.debug("Changing to HKCR root")
                 self.current_root_handle = self.root_handle.setdefault(
                     RootKeys.HKEY_CLASSES_ROOT.value,
                     self.client.sr1_req(
@@ -815,6 +826,7 @@ class RegClient(CLIUtil):
 
             case RootKeys.HKEY_CURRENT_USER:
                 # Change to HKCU root
+                logger.debug("Changing to HKCU root")
                 self.current_root_handle = self.root_handle.setdefault(
                     RootKeys.HKEY_CURRENT_USER.value,
                     self.client.sr1_req(
@@ -829,6 +841,7 @@ class RegClient(CLIUtil):
 
             case RootKeys.HKEY_LOCAL_MACHINE:
                 # Change to HKLM root
+                logger.debug("Changing to HKLM root")
                 self.current_root_handle = self.root_handle.setdefault(
                     RootKeys.HKEY_LOCAL_MACHINE.value,
                     self.client.sr1_req(
@@ -842,7 +855,8 @@ class RegClient(CLIUtil):
                 )
 
             case RootKeys.HKEY_CURRENT_CONFIG:
-                # Change to HKCU root
+                # Change to HKCC root
+                logger.debug("Changing to HKCC root")
                 self.current_root_handle = self.root_handle.setdefault(
                     RootKeys.HKEY_CURRENT_CONFIG.value,
                     self.client.sr1_req(
@@ -856,6 +870,8 @@ class RegClient(CLIUtil):
                 )
 
             case RootKeys.HKEY_USERS:
+                # Cange to HKU root
+                logger.debug("Changing to HKU root")
                 self.current_root_handle = self.root_handle.setdefault(
                     RootKeys.HKEY_USERS.value,
                     self.client.sr1_req(
@@ -869,12 +885,14 @@ class RegClient(CLIUtil):
                 )
 
             case RootKeys.HKEY_PERFORMANCE_DATA:
+                # Change to HKPD root
+                logger.debug("Changing to HKPD root")
                 self.current_root_handle = self.root_handle.setdefault(
                     RootKeys.HKEY_PERFORMANCE_DATA.value,
                     self.client.sr1_req(
                         OpenPerformanceData_Request(
                             ServerName=None,
-                            samDesired=self.sam_requested_access_rights,
+                            samDesired=0,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -882,12 +900,14 @@ class RegClient(CLIUtil):
                 )
 
             case RootKeys.HKEY_PERFORMANCE_TEXT:
+                # Change to HKPT root
+                logger.debug("Changing to HKPT root")
                 self.current_root_handle = self.root_handle.setdefault(
                     RootKeys.HKEY_PERFORMANCE_TEXT.value,
                     self.client.sr1_req(
                         OpenPerformanceText_Request(
                             ServerName=None,
-                            samDesired=0,  # self.sam_requested_access_rights,
+                            samDesired=0,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -895,12 +915,14 @@ class RegClient(CLIUtil):
                 )
 
             case RootKeys.HKEY_PERFORMANCE_NLSTEXT:
+                # Change to HKPN root
+                logger.debug("Changing to HKPN root")
                 self.current_root_handle = self.root_handle.setdefault(
                     RootKeys.HKEY_PERFORMANCE_NLSTEXT.value,
                     self.client.sr1_req(
                         OpenPerformanceNlsText_Request(
                             ServerName=None,
-                            samDesired=self.sam_requested_access_rights,
+                            samDesired=0,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -941,6 +963,7 @@ class RegClient(CLIUtil):
         EnumKeys of the current subkey path
         """
 
+        # Try to use the cache
         res = self._get_cached_elt(subkey=subkey, cache_name="ls")
         if res is None:
             return []
@@ -955,6 +978,7 @@ class RegClient(CLIUtil):
         subkey_path = self._join_path(self.current_subkey_path, subkey)
 
         idx = 0
+        logger.debug("Enumerating keys in %s", subkey_path)
         while True:
             req = BaseRegEnumKey_Request(
                 hKey=res.handle,
@@ -965,13 +989,14 @@ class RegClient(CLIUtil):
                 ndr64=True,
             )
 
+            # Send request
             resp = self.client.sr1_req(req)
             if resp.status == ErrorCodes.ERROR_NO_MORE_ITEMS:
                 break
+
+            # Check the response status
             elif not is_status_ok(resp.status):
-                print(
-                    f"[-] Error : got status {hex(resp.status)} while enumerating keys"
-                )
+                logger.error("Got status %s while enumerating keys", hex(resp.status))
                 self.cache["ls"].pop(subkey_path, None)
                 return []
 
@@ -1030,6 +1055,8 @@ class RegClient(CLIUtil):
             - May print error messages to standard output if RPC queries fail.
             - Updates internal cache for previously enumerated subkey paths.
         """
+
+        # Try to use the cache
         res = self._get_cached_elt(subkey=subkey, cache_name="cat")
         if res is None:
             return []
@@ -1041,6 +1068,7 @@ class RegClient(CLIUtil):
         subkey_path = self._join_path(self.current_subkey_path, subkey)
 
         idx = 0
+        logger.debug("Enumerating values in %s", subkey_path)
         while True:
             # Get the name of the value at index idx
             req = BaseRegEnumValue_Request(
@@ -1061,13 +1089,14 @@ class RegClient(CLIUtil):
                 ndr64=True,
             )
 
+            # Send request
             resp = self.client.sr1_req(req)
             if resp.status == ErrorCodes.ERROR_NO_MORE_ITEMS:
                 break
+
+            # Check the response status
             elif not is_status_ok(resp.status):
-                print(
-                    f"[-] Error : got status {hex(resp.status)} while enumerating values"
-                )
+                logger.error("got status %s while enumerating values", hex(resp.status))
                 self.cache["cat"].pop(subkey_path, None)
                 return []
 
@@ -1087,6 +1116,7 @@ class RegClient(CLIUtil):
                 ndr64=True,
             )
 
+            # Send request
             resp2 = self.client.sr1_req(req)
             if resp2.status == ErrorCodes.ERROR_MORE_DATA:
                 # The buffer was too small, we need to retry with a larger one
@@ -1094,10 +1124,9 @@ class RegClient(CLIUtil):
                 req.lpData.value.max_count = resp2.lpcbData.value
                 resp2 = self.client.sr1_req(req)
 
+            # Check the response status
             if not is_status_ok(resp2.status):
-                print(
-                    f"[-] Error : got status {hex(resp2.status)} while querying value"
-                )
+                logger.error("got status %s while querying value", hex(resp2.status))
                 self.cache["cat"].pop(subkey_path, None)
                 return []
 
@@ -1121,6 +1150,7 @@ class RegClient(CLIUtil):
         """
         Print the output of 'cat'
         """
+
         if not results or len(results) == 0:
             print("No values found.")
             return
@@ -1150,12 +1180,14 @@ class RegClient(CLIUtil):
         """
         Change current subkey path
         """
+
         if subkey.strip() == "":
             # If the subkey is ".", we do not change the current subkey path
             tmp_path = PureWindowsPath()
             tmp_handle = self.get_handle_on_subkey(tmp_path)
 
         else:
+            # Try to use the cache
             res = self._get_cached_elt(
                 subkey=subkey,
                 cache_name="cd",
@@ -1178,6 +1210,7 @@ class RegClient(CLIUtil):
         """
         Auto-complete cd
         """
+
         return self.ls_complete(subkey)
 
     @CLIUtil.addoutput(cd)
@@ -1185,6 +1218,7 @@ class RegClient(CLIUtil):
         """
         Print the output of 'cd'
         """
+
         if self.exploration_mode:
             print(pwd)
             print("-" * 10 + " SubKeys" + "-" * 10)
@@ -1197,6 +1231,7 @@ class RegClient(CLIUtil):
         """
         Activate exploration mode: perform ls and cat automatically when changing directory
         """
+
         self.exploration_mode = True
         print("Exploration mode activated")
 
@@ -1205,6 +1240,7 @@ class RegClient(CLIUtil):
         """
         Disable exploration mode
         """
+
         self.exploration_mode = False
         print("Exploration mode disabled")
 
@@ -1216,12 +1252,15 @@ class RegClient(CLIUtil):
     def get_sd(self, subkey: str | None = None) -> SECURITY_DESCRIPTOR | None:
         """
         Get the security descriptor of the current subkey. SACL are not retrieve at this point (TODO).
-
         """
+
+        # Try to use the cache
         handle = self._get_cached_elt(subkey=subkey)
         if handle is None:
             return None
 
+        # Log and execute
+        logger.debug("Getting security descriptor for %s", subkey)
         req = BaseRegGetKeySecurity_Request(
             hKey=handle,
             SecurityInformation=0x00000001  # OWNER_SECURITY_INFORMATION
@@ -1233,6 +1272,7 @@ class RegClient(CLIUtil):
             ndr64=True,
         )
 
+        # Send request
         resp = self.client.sr1_req(req)
         if resp.status == ErrorCodes.ERROR_INSUFFICIENT_BUFFER:
             # The buffer was too small, we need to retry with a larger one
@@ -1241,12 +1281,14 @@ class RegClient(CLIUtil):
             )
             resp = self.client.sr1_req(req)
 
+        # Check the response status
         if not is_status_ok(resp.status):
-            print(f"[-] Error : got status {hex(resp.status)} while getting security")
+            logger.error("Got status %s while getting security", hex(resp.status))
             return None
 
-        results = resp.pRpcSecurityDescriptorOut.valueof("lpSecurityDescriptor")
-        sd = SECURITY_DESCRIPTOR(results)
+        sd = SECURITY_DESCRIPTOR(
+            resp.pRpcSecurityDescriptorOut.valueof("lpSecurityDescriptor")
+        )
         return sd
 
     @CLIUtil.addoutput(get_sd)
@@ -1254,6 +1296,7 @@ class RegClient(CLIUtil):
         """
         Print the output of 'get_sd'
         """
+
         if sd is None:
             print("No security descriptor found.")
             return
@@ -1276,18 +1319,25 @@ class RegClient(CLIUtil):
         :return: BaseRegQueryInfoKey_Response object containing information about the subkey.
                  Returns None if the handle is invalid or an error occurs during the query.
         """
+
+        # Try to use the cache
         handle = self._get_cached_elt(subkey)
         if handle is None:
             logger.error("Could not get handle on the specified subkey.")
             return None
 
+        # Log and execute
+        logger.debug("Querying info for %s", subkey)
         req = BaseRegQueryInfoKey_Request(
             hKey=handle,
             lpClassIn=RPC_UNICODE_STRING(),  # pointer to class name
             ndr64=True,
         )
 
+        # Send request
         resp = self.client.sr1_req(req)
+
+        # Check the response status
         if not is_status_ok(resp.status):
             logger.error("Got status %s while querying info", hex(resp.status))
             return None
@@ -1298,6 +1348,7 @@ class RegClient(CLIUtil):
         """
         Print the output of 'query_info'
         """
+
         if info is None:
             print("No information found.")
             return
@@ -1316,10 +1367,12 @@ Info on key:
     @CLIUtil.addcommand()
     def version(self) -> NDRIntField:
         """
-        Get remote registry server version
+        Get remote registry server version of the current subkey
         """
+
+        logger.debug("Getting remote registry server version")
         return self.client.sr1_req(
-            BaseRegGetVersion_Request(hKey=self.current_root_handle)
+            BaseRegGetVersion_Request(hKey=self.current_subkey_handle, ndr64=True)
         ).lpdwVersion
 
     @CLIUtil.addoutput(version)
@@ -1327,6 +1380,7 @@ Info on key:
         """
         Print the output of 'version'
         """
+
         print(f"Remote registry server version: {version}")
 
     # --------------------------------------------- #
@@ -1345,6 +1399,8 @@ Info on key:
         Set a registry value in the current subkey.
         If no subkey is specified, it uses the current subkey path.
         """
+
+        # Validate the value type
         try:
             value_type = RegType.fromvalue(value_type)
         except ValueError:
@@ -1353,12 +1409,26 @@ Info on key:
 
         data = RegEntry.encode_data(value_type, value_data)
 
+        # Try to use the cache
         handle = self._get_cached_elt(
             subkey=subkey, desired_access=AccessRights.KEY_WRITE
         )
         if handle is None:
             logger.error("Could not get handle on the specified subkey.")
             return None
+
+        if subkey is None:
+            subkey_path = self.current_subkey_path
+        else:
+            subkey_path = self._join_path(self.current_subkey_path, subkey)
+
+        # Log and execute
+        logger.debug(
+            "Setting value %s of type %s in %s",
+            value_name,
+            value_type.name,
+            subkey_path,
+        )
         req = BaseRegSetValue_Request(
             hKey=handle,
             lpValueName=RPC_UNICODE_STRING(Buffer=value_name + "\x00"),
@@ -1367,16 +1437,15 @@ Info on key:
             ndr64=True,
         )
 
+        # Send request
         resp = self.client.sr1_req(req)
+
         # We remove the entry from the cache if it exists
         # Even if the response status is not OK, we want to remove it
-        if subkey is None:
-            subkey_path = self.current_subkey_path
-        else:
-            subkey_path = self._join_path(self.current_subkey_path, subkey)
         if subkey_path in self.cache["cat"]:
             self.cache["cat"].pop(subkey_path, None)
 
+        # Check the response status
         if not is_status_ok(resp.status):
             logger.error("Got status %s while setting value", hex(resp.status))
             return None
@@ -1391,6 +1460,7 @@ Info on key:
         :param subkey: relative subkey to create the the new key
         """
 
+        # Try to use the cache
         handle = self._get_cached_elt(
             subkey=subkey,
             desired_access=AccessRights.KEY_CREATE_SUB_KEY,
@@ -1398,6 +1468,14 @@ Info on key:
         if handle is None:
             logger.error("Could not get handle on the specified subkey.")
             return None
+
+        if subkey is None:
+            subkey_path = self.current_subkey_path
+        else:
+            subkey_path = self._join_path(self.current_subkey_path, subkey)
+
+        # Log and execute
+        logger.debug("Creating key %s under %s", new_key, subkey_path)
         req = BaseRegCreateKey_Request(
             hKey=handle,
             lpSubKey=RPC_UNICODE_STRING(Buffer=new_key + "\x00"),
@@ -1407,19 +1485,17 @@ Info on key:
             ndr64=True,
         )
 
+        # Send request
         resp = self.client.sr1_req(req)
+
         # We remove the entry from the cache if it exists
         # Even if the response status is not OK, we want to remove it
-        if subkey is None:
-            subkey_path = self.current_subkey_path
-        else:
-            subkey_path = self._join_path(self.current_subkey_path, subkey)
-
         if subkey_path in self.cache["ls"]:
             self.cache["ls"].pop(subkey_path, None)
         if subkey_path in self.cache["cat"]:
             self.cache["cat"].pop(subkey_path, None)
 
+        # Check the response status
         if not is_status_ok(resp.status):
             logger.error("Got status %s while creating key", hex(resp.status))
             return None
@@ -1434,27 +1510,35 @@ Info on key:
 
         :param subkey: The subkey to delete. If None, it uses the current subkey path.
         """
+
+        # Make sure that we have a backup activated
         self.activate_backup()
+
+        # Determine the subkey path for logging and cache purposes
         if subkey is None:
             subkey_path = self.current_subkey_path
         else:
             subkey_path = self._join_path(self.current_subkey_path, subkey)
 
+        # Log and execute
+        logger.debug("Deleting key %s", subkey_path)
         req = BaseRegDeleteKey_Request(
             hKey=self.current_root_handle,
             lpSubKey=RPC_UNICODE_STRING(Buffer=str(subkey_path) + "\x00"),
             ndr64=True,
         )
 
+        # Send request
         resp = self.client.sr1_req(req)
+
         # We remove the entry from the cache if it exists
         # Even if the response status is not OK, we want to remove it
-
         if subkey_path in self.cache["ls"]:
             self.cache["ls"].pop(subkey_path, None)
         if subkey_path in self.cache["cat"]:
             self.cache["cat"].pop(subkey_path, None)
 
+        # Check the response status
         if not is_status_ok(resp.status):
             logger.error("Got status %s while deleting key", hex(resp.status))
             return None
@@ -1466,6 +1550,7 @@ Info on key:
         """
         Auto-complete delete_key
         """
+
         return self.ls_complete(subkey)
 
     @CLIUtil.addcommand()
@@ -1477,7 +1562,11 @@ Info on key:
 
         :param subkey: The subkey to delete. If None, it uses the current subkey path.
         """
+
+        # Make sure that we have a backup activated
         self.activate_backup()
+
+        # Try to use the cache
         handle = self._get_cached_elt(
             subkey=subkey, desired_access=AccessRights.KEY_WRITE
         )
@@ -1485,24 +1574,29 @@ Info on key:
             logger.error("Could not get handle on the specified subkey.")
             return None
 
+        # Determine the subkey path for logging and cache purposes
+        if subkey is None:
+            subkey_path = self.current_subkey_path
+        else:
+            subkey_path = self._join_path(self.current_subkey_path, subkey)
+
+        # Log and execute
+        logger.debug("Deleting value %s in %s", value, subkey_path)
         req = BaseRegDeleteValue_Request(
             hKey=handle,
             lpValueName=RPC_UNICODE_STRING(Buffer=value + "\x00"),
             ndr64=True,
         )
 
+        # Send request
         resp = self.client.sr1_req(req)
+
         # We remove the entry from the cache if it exists
         # Even if the response status is not OK, we want to remove it
-        # We remove the entry from the cache if it exists
-        # Even if the response status is not OK, we want to remove it
-        if subkey is None:
-            subkey_path = self.current_subkey_path
-        else:
-            subkey_path = self._join_path(self.current_subkey_path, subkey)
         if subkey_path in self.cache["cat"]:
             self.cache["cat"].pop(subkey_path, None)
 
+        # Check the response status
         if not is_status_ok(resp.status):
             logger.error("Got status %s while setting value", hex(resp.status))
             return None
@@ -1514,6 +1608,7 @@ Info on key:
         """
         Auto-complete delete_value
         """
+
         if self._require_root_handles(silent=True):
             return []
 
@@ -1544,7 +1639,11 @@ Info on key:
         :param subkey: The subkey to backup. If None, it uses the current subkey path.
         :return: None, by default it saves the backup to a file protected so that only BA can read it.
         """
+
+        # Make sure that we have a backup activated
         self.activate_backup()
+
+        # Try to use the cache
         handle = self._get_cached_elt(subkey=subkey)
         key_to_save = (
             subkey.split("\\")[-1] if subkey else self.current_subkey_path.name
@@ -1570,6 +1669,7 @@ Info on key:
             print(
                 "Looks like you don't like security so much. Hope you know what you are doing."
             )
+            logger.warning("Disabling security built-in protections while saving.")
             sa = None
         else:
             sa = PRPC_SECURITY_ATTRIBUTES(
@@ -1579,8 +1679,10 @@ Info on key:
                 bInheritHandle=False,
                 ndr64=True,
             )
-
             sa.nLength = len(sa)
+
+        # Log and execute
+        logger.debug("Backing up %s to %s", key_to_save, output_path)
         req = BaseRegSaveKey_Request(
             hKey=handle,
             lpFile=RPC_UNICODE_STRING(Buffer=output_path),
@@ -1588,7 +1690,10 @@ Info on key:
             ndr64=True,
         )
 
+        # Send request
         resp = self.client.sr1_req(req)
+
+        # Check the response status
         if not is_status_ok(resp.status):
             logger.error("Got status %s while backing up", hex(resp.status))
         else:
@@ -1609,12 +1714,17 @@ Info on key:
         Activate the backup option for the registry operations (enable your backup privilege).
         This enable the backup privilege for the current session.
         """
+
         # check if backup privilege is already enabled
         if self.extra_options & RegOptions.REG_OPTION_BACKUP_RESTORE:
-            print("Backup option is already activated. Didn't do anything.")
+            logger.info("Backup option is already activated. Didn't do anything.")
             return
         self.extra_options |= RegOptions.REG_OPTION_BACKUP_RESTORE
+
+        # Log and print
         print("Backup option activated.")
+        logger.debug("Backup option activated.")
+
         # Clear the local cache, as the backup option will change the behavior of the registry
         self._clear_all_caches()
 
@@ -1624,12 +1734,18 @@ Info on key:
         Disable the backup option for the registry operations (disable your backup privilege).
         This disable the backup privilege for the current session.
         """
+
         # check if backup privilege is already disabled
         if not self.extra_options & RegOptions.REG_OPTION_BACKUP_RESTORE:
             print("Backup option is already disabled. Didn't do anything.")
             return
         self.extra_options &= ~RegOptions.REG_OPTION_BACKUP_RESTORE
+
+        # Log and print
         print("Backup option deactivated.")
+        logger.debug("Backup option deactivated.")
+
+        # Clear the local cache, as the backup option will change the behavior of the registry
         self._clear_all_caches()
 
     @CLIUtil.addcommand()
@@ -1638,6 +1754,7 @@ Info on key:
         Set the registry operations to be volatile.
         This means that the registry key will be deleted when the system is restarted.
         """
+
         self.extra_options |= RegOptions.REG_OPTION_VOLATILE
         self.extra_options &= ~RegOptions.REG_OPTION_NON_VOLATILE
         self.use(self.current_root_path)
@@ -1651,6 +1768,7 @@ Info on key:
         Disable the volatile option for the registry operations.
         This means that the registry key will not be deleted when the system is restarted.
         """
+
         self.extra_options &= ~RegOptions.REG_OPTION_VOLATILE
         self.extra_options |= RegOptions.REG_OPTION_NON_VOLATILE
         self.use(self.current_root_path)
@@ -1674,11 +1792,14 @@ Info on key:
         :param desired_access_rights: The desired access rights for the subkey. If None, defaults to read access rights.
         :return: An NDRContextHandle on success, None on failure.
         """
+
         # If we don't have a root handle, we cannot get a subkey handle
         # This is a safety check, as we should not be able to call this function
         # without having a root handle already set.
         if self._require_root_handles(silent=True):
             return None
+
+        # Convert subkey_path to string and ensure it is null-terminated
         if str(subkey_path) == ".":
             subkey_path = "\x00"
         else:
@@ -1687,8 +1808,11 @@ Info on key:
         # If no access rights were specified, we use the default read access rights
         if desired_access_rights is None:
             # Default to read access rights
-            desired_access_rights = AccessRights.KEY_READ
+            desired_access_rights = (
+                AccessRights.KEY_READ | AccessRights.STANDARD_RIGHTS_READ
+            )
 
+        # Log and execute
         logger.debug(
             "Getting handle on subkey: %s with access rights: %s",
             subkey_path,
@@ -1702,10 +1826,13 @@ Info on key:
             ndr64=True,
         )
 
+        # Send request
         resp = self.client.sr1_req(req)
+
+        # Check the response status
         if not is_status_ok(resp.status):
             logger.error(
-                "[-] Error : got status %s while getting handle on key",
+                "Got status %s while getting handle on key",
                 hex(resp.status),
             )
             return None
@@ -1729,22 +1856,25 @@ Info on key:
         :param desired_access: The desired access rights for the subkey. If None, defaults to read access rights.
         :return: A CacheElt object if cache_name is provided, otherwise an NDRContextHandle.
         """
+
         if self._require_root_handles(silent=True):
             return None
 
         if desired_access is None:
             # Default to read access rights
-            desired_access = AccessRights.KEY_READ
+            desired_access = AccessRights.KEY_READ | AccessRights.STANDARD_RIGHTS_READ
 
         # If no specific subkey was specified
         # we use our current subkey path
         if subkey is None or subkey == "" or subkey == ".":
             subkey_path = self.current_subkey_path
+
         # Otherwise we use the subkey path,
         # the calling parent shall make sure that this path was properly sanitized
         else:
             subkey_path = self._join_path(self.current_subkey_path, subkey)
 
+        # If cache name is specified, we try to use it
         if (
             self.cache.get(cache_name, None) is not None
             and self.cache[cache_name].get(subkey_path, None) is not None
@@ -1760,6 +1890,7 @@ Info on key:
             logger.error("Could not get handle on %s", subkey_path)
             return None
 
+        # If we have a cache name, we store the handle in the cache
         cache_elt = CacheElt(handle, desired_access, [])
         if cache_name is not None:
             self.cache[cache_name][subkey_path] = cache_elt
@@ -1778,6 +1909,7 @@ Info on key:
         :param second_path: The second path to join.
         :return: A PureWindowsPath object representing the combined path.
         """
+
         if first_path is None:
             first_path = ""
         if second_path is None:
@@ -1803,6 +1935,7 @@ Info on key:
         :param silent: If True, do not print any message if no root handle is set.
         :return: True if no root handle is set, False otherwise.
         """
+
         if self.current_root_handle is None:
             if not silent:
                 print("No root key selected ! Use 'use' to use one.")
@@ -1813,6 +1946,7 @@ Info on key:
         """
         Clear all caches
         """
+
         for _, c in self.cache.items():
             c.clear()
 
@@ -1821,6 +1955,7 @@ Info on key:
         """
         Joker function to jump into the python code for dev purpose
         """
+
         logger.info("Jumping into the code for dev purpose...")
         # pylint: disable=forgotten-debug-statement, pointless-statement
         breakpoint()
