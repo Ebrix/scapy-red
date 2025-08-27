@@ -36,7 +36,7 @@ The available root keys are:
 * HKEY_PERFORMANCE_NLSTEXT (**HKPN**)
 * HKEY_PERFORMANCE_TEXT (**HKPT**)
 
-.. code-block:: python
+.. code-block:: bash
     :caption: CLI usage example
 
     >>> [reg] CHOOSE ROOT KEY\. > use HKLM
@@ -54,7 +54,7 @@ The available root keys are:
 
 The ``ls`` function lists the subkeys of the current key or a specified relative key.
 
-.. code-block:: python
+.. code-block:: bash
     :caption: CLI usage example
 
     >>> [reg] HKLM\. > ls
@@ -82,7 +82,7 @@ The ``ls`` function lists the subkeys of the current key or a specified relative
 
 The ``cd`` function changes the current subkey to a specified relative key or to the root of the current root key.
 
-.. code-block:: python
+.. code-block:: bash
     :caption: CLI usage example
 
     >>> [reg] HKLM\. > cd SYSTEM\CurrentControlSet\Services
@@ -104,7 +104,7 @@ The ``cd`` function changes the current subkey to a specified relative key or to
 
 The ``cat`` function displays the values of the current key or a specified relative key.
 
-.. code-block:: python
+.. code-block:: bash
     :caption: CLI usage example
 
     >>> [reg] HKLM\. > cat
@@ -141,7 +141,7 @@ Future development may include an option to display it as "(Default)" for better
 
 The ``query_info`` function retrieves information about the current key or a specified relative key, including the number of subkeys, number of values, and last write time.
 
-.. code-block:: python
+.. code-block:: bash
     :caption: CLI usage example
 
     >>> [reg] HKLM\SYSTEM\CurrentControlSet\Services\winmgmt > query_info
@@ -156,7 +156,7 @@ The ``query_info`` function retrieves information about the current key or a spe
 ``version``: Get the remote registry version
 =============================================
 
-.. code-block:: python
+.. code-block:: bash
     :caption: CLI usage example
 
     >>> [reg] HKLM\SYSTEM\CurrentControlSet\Services\winmgmt > version
@@ -170,7 +170,7 @@ The ``get_sd`` function retrieves the security descriptor of the current key or 
 The information is displayed in a kindof human-readable format. Yet, information displayed is currently incomplete.
 Upcoming versions will provide a more complete and user-friendly output.
 
-.. code-block:: python
+.. code-block:: bash
     :caption: CLI usage example
 
     >>> [reg] HKLM\. > get_sd SAM
