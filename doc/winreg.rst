@@ -130,6 +130,7 @@ The ``cat`` function displays the values of the current key or a specified relat
   - Type                (REG_DWORD - 4) 32
   -                     (REG_SZ - 1)    This is the default value
 
+
 Notice how the default value is represented with an empty name, when regedit shows it as "(Default)".
 This is a design choice to avoid confusion with a value that would actually be named "(Default)".
 Future development may include an option to display it as "(Default)" for better user experience.
