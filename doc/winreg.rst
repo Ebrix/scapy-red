@@ -107,13 +107,7 @@ The ``cat`` function displays the values of the current key or a specified relat
 .. code-block:: bash
     :caption: CLI usage example
 
-    >>> [reg] HKLM\. > cat
-        Values:
-        (Default)    REG_SZ    (value not set)
-        Class        REG_SZ    (value not set)
-        LastWriteTime    REG_QWORD    132537600000000000
-        ...
-        >>> [reg] HKLM\SYSTEM\CurrentControlSet\Services\winmgmt > cat
+    >>> [reg] HKLM\SYSTEM\CurrentControlSet\Services\winmgmt > cat
       - DependOnService     (REG_MULTI_SZ - 7) RPCSS
     
       - Description         (REG_SZ - 1)    @%Systemroot%\system32\wbem\wmisvc.dll,-204
@@ -184,3 +178,161 @@ Upcoming versions will provide a more complete and user-friendly output.
          -  (A;CI;;;;S-1-3-0)
          -  (A;CI;;;;S-1-15-2-1)
          -  (A;CI;;;;S-1-15-3-1024-1065365936-1281604716-3511738428-1654721687-432734479-3232135806-4053264122-3456934681)
+
+========================================
+``save``: Save the registry to a file
+========================================
+
+The ``save`` function saves the entire registry or a specified root key to a file in a format similar to that of regedit export files.
+
+.. code-block:: bash
+    :caption: CLI usage example
+
+    >>> [reg] HKLM\. > save C:\\my_SAM_backup.reg SAM
+        Backup option activated.
+        [INFO] Backup of SAM saved to C:\\my_SAM_backup.reg successful 
+        Backup of SAM saved to C:\\my_SAM_backup
+
+
+Notice that by default the access to the saved file is restricted to the Administrators group.
+This is hardcoded in the current implementation. Future versions may include an option to customize the file permissions.
+If you want to remove this hardcoded behavior, you can use the additional ``fsecurity`` option of the ``save`` function.
+This option will not request any specific permissions when creating the file, and the 
+file **will inherit the default permissions of the parent directory**. Should you put a sensitive backup in
+a directory with weak permissions, you may expose it to unauthorized access.
+
+.. code-block:: powershell
+    :caption: CLI usage example
+
+    >>> PS C:\> Get-Acl .\my_SAM_backup.reg | fl
+        Path   : Microsoft.PowerShell.Core\FileSystem::C:\my_SAM_backup.reg
+        Owner  : BUILTIN\Administrators
+        Group  :
+        Access : BUILTIN\Administrators Allow  FullControl
+        Audit  :
+        Sddl   : O:BAG:DUD:P(A;;FA;;;BA)
+
+
+========================================
+``create_key``: Create a new subkey
+========================================
+
+The ``create_key`` function creates a new subkey under the current key or a specified relative key.
+
+.. code-block:: bash
+    :caption: CLI usage example
+
+    >>> [reg] HKLM\SOFTWARE\examples > ls
+        [reg] HKLM\SOFTWARE\examples > create_key MySubKey
+        Key MySubKey created successfully.
+        [reg] HKLM\SOFTWARE\examples > ls
+        MySubKey
+        [reg] HKLM\SOFTWARE\examples >
+
+========================================
+``delete_key``: Delete a subkey
+========================================
+
+The ``delete_key`` function deletes a specified subkey under the current key or a specified relative key.
+Note that the subkey to be deleted must not have any subkeys. If it does, you need to delete them first.
+
+.. code-block:: bash
+    :caption: CLI usage example
+
+    >>> [reg] HKLM\SOFTWARE\examples > ls
+        MySubKey
+        [reg] HKLM\SOFTWARE\examples > cd ..
+        [reg] HKLM\SOFTWARE > ls
+        Classes
+        Clients
+        DefaultUserEnvironment
+        examples
+        Google
+        Microsoft
+        ODBC
+        OEM
+        OpenSSH
+        Partner
+        Policies
+        RegisteredApplications
+        Setup
+        WOW6432Node
+        [reg] HKLM\SOFTWARE > delete_key examples
+        [ERROR] Error: 0x5 - ERROR_ACCESS_DENIED
+        [ERROR] Got status 0x5 while deleting key
+        [reg] HKLM\SOFTWARE > delete_key examples\\MySubKey
+        Key examples\MySubKey deleted successfully.
+        [reg] HKLM\SOFTWARE > delete_key examples
+        Key examples deleted successfully.
+        [reg] HKLM\SOFTWARE > ls
+        Classes
+        Clients
+        DefaultUserEnvironment
+        Google
+        Microsoft
+        ODBC
+        OEM
+        OpenSSH
+        Partner
+        Policies
+        RegisteredApplications
+        Setup
+        WOW6432Node
+        [reg] HKLM\SOFTWARE >
+
+
+========================================
+``set_value``: Set or create a value
+========================================
+
+The ``set_value`` function sets the data of an existing value or creates a new value under the current key or a specified relative key.
+
+.. code-block:: bash
+    :caption: CLI usage example
+
+    >>> [reg] HKLM\SOFTWARE\examples > set_value string 1 MyUnicodeString
+        [reg] HKLM\SOFTWARE\examples > cat
+        - string              (REG_SZ - 1)    MyUnicodeString
+        [reg] HKLM\SOFTWARE\examples > set_value string 2 %APPDATA%UnicodeString
+        [reg] HKLM\SOFTWARE\examples > cat
+          - string              (REG_EXPAND_SZ - 2) %APPDATA%UnicodeString
+        [reg] HKLM\SOFTWARE\examples > set_value bin 3 01044923afebc000
+        [reg] HKLM\SOFTWARE\examples > set_value mydword 4 012345
+        [reg] HKLM\SOFTWARE\examples > set_value myBEdword 5 0123451238412304
+        [reg] HKLM\SOFTWARE\examples > cat
+          - string              (REG_EXPAND_SZ - 2) %APPDATA%UnicodeString
+          - bin                 (REG_BINARY - 3) b'01044923afebc000'
+          - mydword             (REG_DWORD - 4) 12345
+          - myBEdword           (REG_DWORD_BIG_ENDIAN - 5) 123451238412304
+
+Notice that:
+ 
+* the data for REG_BINARY values must be provided as a hexadecimal string. 
+* the data for REG_DWORD and REG_DWORD_BIG_ENDIAN values must be provided as a base-10 integer.
+* it's not currently possible via the CLI to set value with spaces in their names or in the data. This is a limitation of the current CLI parser.
+  You can still use the Python API to set values with spaces in their names. Yet I agree this is not very user-friendly.
+  Future versions may include a more advanced CLI parser to handle this case.
+* when setting a value that already exists, its data type is updated to the new type provided.
+* it's not currently possible to set the default value of a key via the CLI. 
+
+========================================
+``delete_value``: Delete a value
+========================================
+
+The ``delete_value`` function deletes a specified value under the current key or a specified relative key.
+
+.. code-block:: bash
+    :caption: CLI usage example
+
+    >>> [reg] HKLM\SOFTWARE\examples > cat
+          - string              (REG_EXPAND_SZ - 2) %APPDATA%UnicodeString
+          - bin                 (REG_BINARY - 3) b'01044923afebc000'
+          - mydword             (REG_DWORD - 4) 12345
+          - myBEdword           (REG_DWORD_BIG_ENDIAN - 5) 123451238412304
+        [reg] HKLM\SOFTWARE\examples > delete_value bin
+        Backup option activated.
+        Value bin deleted successfully.
+        [reg] HKLM\SOFTWARE\examples > cat
+          - string              (REG_EXPAND_SZ - 2) %APPDATA%UnicodeString
+          - mydword             (REG_DWORD - 4) 12345
+          - myBEdword           (REG_DWORD_BIG_ENDIAN - 5) 123451238412304

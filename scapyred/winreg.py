@@ -1475,9 +1475,10 @@ Info on key:
             return None
 
         if subkey is None:
-            subkey_path = self.current_subkey_path
+            subkey_path = self._join_path(self.current_subkey_path, new_key)
         else:
             subkey_path = self._join_path(self.current_subkey_path, subkey)
+            subkey_path = self._join_path(subkey_path, new_key)
 
         # Log and execute
         logger.debug("Creating key %s under %s", new_key, subkey_path)
