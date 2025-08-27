@@ -108,27 +108,27 @@ The ``cat`` function displays the values of the current key or a specified relat
     :caption: CLI usage example
 
     >>> [reg] HKLM\. > cat
-    Values:
-    (Default)    REG_SZ    (value not set)
-    Class        REG_SZ    (value not set)
-    LastWriteTime    REG_QWORD    132537600000000000
-    ...
-    >>> [reg] HKLM\SYSTEM\CurrentControlSet\Services\winmgmt > cat
-  - DependOnService     (REG_MULTI_SZ - 7) RPCSS
-
-  - Description         (REG_SZ - 1)    @%Systemroot%\system32\wbem\wmisvc.dll,-204
-  - DisplayName         (REG_SZ - 1)    @%Systemroot%\system32\wbem\wmisvc.dll,-205
-  - ErrorControl        (REG_DWORD - 4) 0
-  - FailureActions      (REG_BINARY - 3) b'\x80Q\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x14\x00\x00\x00\x01\x00\x00\x00\xc0\xd4\x01\x00\x01\x00\x00\x00\xe0\x93\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-  - ImagePath           (REG_EXPAND_SZ - 2) %systemroot%\system32\svchost.exe -k netsvcs -p
-  - ObjectName          (REG_SZ - 1)    localSystem
-  - ServiceSidType      (REG_DWORD - 4) 1
-  - Start               (REG_DWORD - 4) 2
-  - SvcMemHardLimitInMB (REG_DWORD - 4) 28
-  - SvcMemMidLimitInMB  (REG_DWORD - 4) 20
-  - SvcMemSoftLimitInMB (REG_DWORD - 4) 11
-  - Type                (REG_DWORD - 4) 32
-  -                     (REG_SZ - 1)    This is the default value
+        Values:
+        (Default)    REG_SZ    (value not set)
+        Class        REG_SZ    (value not set)
+        LastWriteTime    REG_QWORD    132537600000000000
+        ...
+        >>> [reg] HKLM\SYSTEM\CurrentControlSet\Services\winmgmt > cat
+      - DependOnService     (REG_MULTI_SZ - 7) RPCSS
+    
+      - Description         (REG_SZ - 1)    @%Systemroot%\system32\wbem\wmisvc.dll,-204
+      - DisplayName         (REG_SZ - 1)    @%Systemroot%\system32\wbem\wmisvc.dll,-205
+      - ErrorControl        (REG_DWORD - 4) 0
+      - FailureActions      (REG_BINARY - 3) b'\x80Q\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x14\x00\x00\x00\x01\x00\x00\x00\xc0\xd4\x01\x00\x01\x00\x00\x00\xe0\x93\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+      - ImagePath           (REG_EXPAND_SZ - 2) %systemroot%\system32\svchost.exe -k netsvcs -p
+      - ObjectName          (REG_SZ - 1)    localSystem
+      - ServiceSidType      (REG_DWORD - 4) 1
+      - Start               (REG_DWORD - 4) 2
+      - SvcMemHardLimitInMB (REG_DWORD - 4) 28
+      - SvcMemMidLimitInMB  (REG_DWORD - 4) 20
+      - SvcMemSoftLimitInMB (REG_DWORD - 4) 11
+      - Type                (REG_DWORD - 4) 32
+      -                     (REG_SZ - 1)    This is the default value
 
 
 Notice how the default value is represented with an empty name, when regedit shows it as "(Default)".
