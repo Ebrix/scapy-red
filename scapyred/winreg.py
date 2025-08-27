@@ -83,14 +83,23 @@ from scapy.layers.msrpce.raw.ms_rrp import (
 )
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(levelname)s][%(funcName)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    filename="winreg.log",  # write logs here
-    filemode="w",
-)
-logger = logging.getLogger(__name__)
+# pylint: disable=logging-fstring-interpolation
+# Set log level to benefit from Scapy warnings
+logger = logging.getLogger("scapy")
+logger.setLevel(logging.INFO)
+# Create a file handler
+file_handler = logging.FileHandler("winreg.log")
+file_handler.setLevel(logging.DEBUG)
+
+# Create a formatter and attach it
+formatter = logging.Formatter("[%(levelname)s][%(funcName)s] %(message)s")
+file_handler.setFormatter(formatter)
+
+# Add the file handler
+logger.addHandler(file_handler)
+
+
+logger.info("Starting scapy-windows-registry module")
 
 
 class GenericAccessRights(IntFlag):
@@ -277,7 +286,7 @@ class RootKeys(StrEnum):
     # Registry entries subordinate to this key define types (or classes) of documents and the
     # properties associated with those types.
     # The subkeys of the HKEY_CLASSES_ROOT key are a merged view of the following two subkeys:
-    HKEY_CLASSES_ROOT = "HKCROOT"
+    HKEY_CLASSES_ROOT = "HKCR"
 
     # Registry entries subordinate to this key define the preferences of the current user.
     # These preferences include the settings of environment variables, data on program groups,
@@ -293,22 +302,22 @@ class RootKeys(StrEnum):
     # This key contains information on the current hardware profile of the local computer.
     # HKEY_CURRENT_CONFIG is an alias for
     # HKEY_LOCAL_MACHINE\System\CurrentControlSet\Hardware Profiles\Current
-    HKEY_CURRENT_CONFIG = "HKC"
+    HKEY_CURRENT_CONFIG = "HKCC"
 
     # This key define the default user configuration for new users on the local computer and the
     # user configuration for the current user.
     HKEY_USERS = "HKU"
 
     # Registry entries subordinate to this key allow access to performance data.
-    HKEY_PERFORMANCE_DATA = "HKPERFDATA"
+    HKEY_PERFORMANCE_DATA = "HKPD"
 
     # Registry entries subordinate to this key reference the text strings that describe counters
     # in U.S. English.
-    HKEY_PERFORMANCE_TEXT = "HKPERFTXT"
+    HKEY_PERFORMANCE_TEXT = "HKPT"
 
     # Registry entries subordinate to this key reference the text strings that describe
     # counters in the local language of the area in which the computer is running.
-    HKEY_PERFORMANCE_NLSTEXT = "HKPERFNLSTXT"
+    HKEY_PERFORMANCE_NLSTEXT = "HKPN"
 
     def __new__(cls, value):
         # 1. Strip and uppercase the raw input
@@ -351,8 +360,8 @@ class RegType(IntEnum):
     Registry value types
     """
 
-    # Registry value types
     # These constants are used to specify the type of a registry value.
+
     REG_SZ = 1  # Unicode string
     REG_EXPAND_SZ = 2  # Unicode string with environment variable expansion
     REG_BINARY = 3  # Binary data
@@ -365,7 +374,7 @@ class RegType(IntEnum):
 
     @classmethod
     def _missing_(cls, value):
-        print(f"Unknown registry type: {value}, using UNK")
+        logger.info(f"Unknown registry type: {value}, using UNK")
         unk = cls.UNK
         unk.real_value = value
         return unk
@@ -388,14 +397,14 @@ class RegType(IntEnum):
             try:
                 return cls(value)
             except ValueError:
-                print(f"Unknown registry type: {value}, using UNK")
+                logger.info(f"Unknown registry type: {value}, using UNK")
                 return cls.UNK
 
         value = value.strip().upper()
         try:
             return cls(int(value))
         except (ValueError, KeyError):
-            print(f"Unknown registry type: {value}, using UNK")
+            logger.info(f"Unknown registry type: {value}, using UNK")
         return cls.UNK
 
 
@@ -427,13 +436,17 @@ def is_status_ok(status: int) -> bool:
             ErrorCodes.ERROR_MORE_DATA,
         ]:
             print(f"[!] Error: {hex(err.value)} - {ErrorCodes(status).name}")
+            logger.error("Error: %s - %s", hex(err.value), ErrorCodes(status).name)
             return False
         return True
     except ValueError as exc:
         print(f"[!] Error: {hex(status)} - Unknown error code")
+        logger.error("Error: %s - %s", hex(err.value), ErrorCodes(status).name)
         raise ValueError(f"Error: {hex(status)} - Unknown error code") from exc
 
 
+# Global constant used to easily record
+# the root keys available and prevent typos
 AVAILABLE_ROOT_KEYS: list[str] = [
     RootKeys.HKEY_LOCAL_MACHINE,
     RootKeys.HKEY_CURRENT_USER,
@@ -449,6 +462,9 @@ AVAILABLE_ROOT_KEYS: list[str] = [
 class WellKnownSIDs(Enum):
     """
     Well-known SIDs.
+
+    .. notes::
+    This class should be filled with more values as needs arise
     """
 
     SY = WINNT_SID.fromstr("S-1-5-18")  # Local System
@@ -469,7 +485,7 @@ DEFAULT_SECURITY_DESCRIPTOR = SECURITY_DESCRIPTOR(
                 AceFlags=0x0,  # No flags
             )
             / WINNT_ACCESS_ALLOWED_ACE(
-                Mask=0x10000000,  # GA
+                Mask=AccessRights.GENERIC_ALL,  # GA
                 Sid=WellKnownSIDs.BA.value,  # Built-in Administrators SID
             ),
         ],
@@ -555,7 +571,9 @@ class RegEntry:
                 return data.encode("utf-8").decode("unicode_escape").encode("latin1")
 
     def __str__(self) -> str:
-        return f"{self.reg_value} ({self.reg_type.name}) {self.reg_data}"
+        if self.reg_type == RegType.UNK:
+            return f"{self.reg_value} ({self.reg_type.name}:{self.reg_type.real_value}) {self.reg_data}"
+        return f"{self.reg_value} ({self.reg_type.name}:{self.reg_type.value}) {self.reg_data}"
 
     def __repr__(self) -> str:
         return f"RegEntry({self.reg_value}, {self.reg_type}, {self.reg_data})"
@@ -567,8 +585,14 @@ class CacheElt:
     Cache element to store the handle and the subkey path
     """
 
+    # Handle on a remote object
     handle: NDRContextHandle
+
+    # Requested AccessRights for this handle
     access: AccessRights
+
+    # List of elements returned by the server
+    # using this handle. For example a list of subkeys or values.
     values: list
 
 
@@ -676,8 +700,8 @@ class RegClient(CLIUtil):
             self.client.bind(self.interface)
 
         except ValueError as exc:
-            print(
-                f"[!] Warn: Remote service didn't seem to be running. Let's try again now that we should have trigger it. ({exc})"
+            logger.warning(
+                f"Remote service didn't seem to be running. Let's try again now that we should have trigger it. ({exc})"
             )
 
             sleep(1.5)
@@ -685,7 +709,7 @@ class RegClient(CLIUtil):
             self.client.bind(self.interface)
         except Scapy_Exception as e:
             if str(3221225566) in str(e):
-                print(
+                logger.error(
                     f"""
     [!] STATUS_LOGON_FAILURE - {e}  You used:
         - UPN {UPN},
@@ -705,7 +729,7 @@ class RegClient(CLIUtil):
                 )
                 exit()
         except TimeoutError as exc:
-            print(
+            logger.error(
                 f"[!] Timeout while connecting to {target}:{port}. Check service status. {exc}"
             )
             sys.exit(-1)
@@ -762,14 +786,14 @@ class RegClient(CLIUtil):
             - Changes the current directory to the root of the selected registry hive.
 
         :param root_path: The root registry path to use. Should start with one of the following:
-            - HKCROOT
+            - HKR
             - HKLM
             - HKCU
-            - HKC
+            - HKCC
             - HKU
-            - HKPERFDATA
-            - HKPERFTXT
-            - HKPERFNLSTXT
+            - HKPD
+            - HKPT
+            - HKPN
         """
 
         root_path = RootKeys(root_path.upper().strip())
@@ -863,7 +887,7 @@ class RegClient(CLIUtil):
                     self.client.sr1_req(
                         OpenPerformanceText_Request(
                             ServerName=None,
-                            samDesired=self.sam_requested_access_rights,
+                            samDesired=0,  # self.sam_requested_access_rights,
                             ndr64=True,
                         ),
                         timeout=self.timeout,
@@ -885,7 +909,7 @@ class RegClient(CLIUtil):
 
             case _:
                 # If the root key is not recognized, raise an error
-                print(f"Unknown root key: {root_path}")
+                logger.error(f"Unknown root key: {root_path}")
                 self._clear_all_caches()
                 self.current_root_handle = None
                 self.current_root_path = "CHOOSE ROOT KEY"
@@ -988,7 +1012,7 @@ class RegClient(CLIUtil):
         ]
 
     @CLIUtil.addcommand(spaces=True)
-    def cat(self, subkey: str | None = None) -> list[tuple[str, str]]:
+    def cat(self, subkey: str | None = None) -> list[RegEntry]:
         """
         Enumerates and retrieves registry values for a given subkey path.
 
@@ -999,8 +1023,8 @@ class RegClient(CLIUtil):
             subkey (str | None): The subkey path to enumerate. If None or empty, uses the current subkey path.
 
         Returns:
-            list[tuple[str, str]]: A list of registry entries (as RegEntry objects) for the specified subkey path.
-                                   Returns an empty list if the handle is invalid or an error occurs during enumeration.
+            list[RegEntry]: A list of registry entries (as RegEntry objects) for the specified subkey path.
+                            Returns an empty list if the handle is invalid or an error occurs during enumeration.
 
         Side Effects:
             - May print error messages to standard output if RPC queries fail.
@@ -1358,24 +1382,50 @@ Info on key:
             return None
 
     @CLIUtil.addcommand()
-    def create_key(
-        self, new_key: str, root_key: str | None, subkey: str | None = None
-    ) -> None:
+    def create_key(self, new_key: str, subkey: str | None = None) -> None:
+        """
+        Create a new key named as the specified `new_key` under the `subkey`.
+        If no subkey is specified, it uses the current subkey path.
+
+        :param new_key: name a the new key to create
+        :param subkey: relative subkey to create the the new key
+        """
+
+        handle = self._get_cached_elt(
+            subkey=subkey,
+            desired_access=AccessRights.KEY_CREATE_SUB_KEY,
+        )
+        if handle is None:
+            logger.error("Could not get handle on the specified subkey.")
+            return None
         req = BaseRegCreateKey_Request(
-            hKey=self.current_subkey_handle,
+            hKey=handle,
             lpSubKey=RPC_UNICODE_STRING(Buffer=new_key + "\x00"),
             samDesired=self.sam_requested_access_rights,
             dwOptions=self.extra_options,
-            lpClass=None,
             lpSecurityAttributes=None,
+            ndr64=True,
         )
+
         resp = self.client.sr1_req(req)
+        # We remove the entry from the cache if it exists
+        # Even if the response status is not OK, we want to remove it
+        if subkey is None:
+            subkey_path = self.current_subkey_path
+        else:
+            subkey_path = self._join_path(self.current_subkey_path, subkey)
+
+        if subkey_path in self.cache["ls"]:
+            self.cache["ls"].pop(subkey_path, None)
+        if subkey_path in self.cache["cat"]:
+            self.cache["cat"].pop(subkey_path, None)
+
         if not is_status_ok(resp.status):
             logger.error("Got status %s while creating key", hex(resp.status))
             return None
         print(f"Key {new_key} created successfully.")
 
-    @CLIUtil.addcommand()
+    @CLIUtil.addcommand(spaces=True)
     def delete_key(self, subkey: str | None = None) -> None:
         """
         Delete the specified subkey. If no subkey is specified, it uses the current subkey path.
@@ -1410,6 +1460,13 @@ Info on key:
             return None
 
         print(f"Key {subkey} deleted successfully.")
+
+    @CLIUtil.addcomplete(delete_key)
+    def delete_key_complete(self, subkey: str) -> list[str]:
+        """
+        Auto-complete delete_key
+        """
+        return self.ls_complete(subkey)
 
     @CLIUtil.addcommand()
     def delete_value(self, value: str = "", subkey: str | None = None) -> None:
@@ -1450,7 +1507,22 @@ Info on key:
             logger.error("Got status %s while setting value", hex(resp.status))
             return None
 
-        print(f"Key {subkey} deleted successfully.")
+        print(f"Value {value} deleted successfully.")
+
+    @CLIUtil.addcomplete(delete_value)
+    def delete_value_complete(self, value: str) -> list[str]:
+        """
+        Auto-complete delete_value
+        """
+        if self._require_root_handles(silent=True):
+            return []
+
+        value = value.strip()
+        return [
+            subval.reg_value.strip("\x00")
+            for subval in self.cat()
+            if str(subval.reg_value).lower().startswith(value.lower())
+        ]
 
     # --------------------------------------------- #
     #                   Backup and Restore
@@ -1633,7 +1705,8 @@ Info on key:
         resp = self.client.sr1_req(req)
         if not is_status_ok(resp.status):
             logger.error(
-                "[-] Error : got status %s while enumerating keys", hex(resp.status)
+                "[-] Error : got status %s while getting handle on key",
+                hex(resp.status),
             )
             return None
 
