@@ -85,22 +85,27 @@ from scapy.layers.msrpce.raw.ms_rrp import (
 
 # pylint: disable=logging-fstring-interpolation
 # Set log level to benefit from Scapy warnings
-logger = logging.getLogger("scapy")
+logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 
-# nique ta mere logger
-for handler in logger.handlers:
-    if isinstance(handler, logging.StreamHandler):
-        handler.setLevel(logging.DEBUG)  # Set desired level
-        break
+# Create a stream handler
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setLevel(logging.INFO)
+
+# Create a formatter and attach it
+formatter_sh = logging.Formatter("[%(levelname)s] %(message)s")
+stream_handler.setFormatter(formatter_sh)
+
+# Add the stream handler
+logger.addHandler(stream_handler)
 
 # Create a file handler
 file_handler = logging.FileHandler("winreg.log")
 file_handler.setLevel(logging.DEBUG)
 
 # Create a formatter and attach it
-formatter = logging.Formatter("[%(levelname)s][%(funcName)s] %(message)s")
-file_handler.setFormatter(formatter)
+formatter_fh = logging.Formatter("[%(levelname)s][%(funcName)s] %(message)s")
+file_handler.setFormatter(formatter_fh)
 
 # Add the file handler
 logger.addHandler(file_handler)
@@ -796,7 +801,7 @@ class RegClient(CLIUtil):
             - Changes the current directory to the root of the selected registry hive.
 
         :param root_path: The root registry path to use. Should start with one of the following:
-            - HKR
+            - HKCR
             - HKLM
             - HKCU
             - HKCC
@@ -1490,8 +1495,8 @@ Info on key:
 
         # We remove the entry from the cache if it exists
         # Even if the response status is not OK, we want to remove it
-        if subkey_path in self.cache["ls"]:
-            self.cache["ls"].pop(subkey_path, None)
+        if subkey_path.parent in self.cache["ls"]:
+            self.cache["ls"].pop(subkey_path.parent, None)
         if subkey_path in self.cache["cat"]:
             self.cache["cat"].pop(subkey_path, None)
 
@@ -1533,8 +1538,8 @@ Info on key:
 
         # We remove the entry from the cache if it exists
         # Even if the response status is not OK, we want to remove it
-        if subkey_path in self.cache["ls"]:
-            self.cache["ls"].pop(subkey_path, None)
+        if subkey_path.parent in self.cache["ls"]:
+            self.cache["ls"].pop(subkey_path.parent, None)
         if subkey_path in self.cache["cat"]:
             self.cache["cat"].pop(subkey_path, None)
 
@@ -1717,7 +1722,7 @@ Info on key:
 
         # check if backup privilege is already enabled
         if self.extra_options & RegOptions.REG_OPTION_BACKUP_RESTORE:
-            logger.info("Backup option is already activated. Didn't do anything.")
+            logger.debug("Backup option is already activated. Didn't do anything.")
             return
         self.extra_options |= RegOptions.REG_OPTION_BACKUP_RESTORE
 
