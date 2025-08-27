@@ -188,10 +188,10 @@ The ``save`` function saves the entire registry or a specified root key to a fil
 .. code-block:: bash
     :caption: CLI usage example
 
-    >>> [reg] HKLM\. > save C:\\my_SAM_backup.reg SAM
+    >>> [reg] HKLM\. > save C:\my_SAM_backup.reg SAM
         Backup option activated.
-        [INFO] Backup of SAM saved to C:\\my_SAM_backup.reg successful 
-        Backup of SAM saved to C:\\my_SAM_backup
+        [INFO] Backup of SAM saved to C:\my_SAM_backup.reg successful 
+        Backup of SAM saved to C:\my_SAM_backup
 
 
 Notice that by default the access to the saved file is restricted to the Administrators group.
