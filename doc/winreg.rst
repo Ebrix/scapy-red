@@ -16,6 +16,9 @@ In the context of the Windows Registry, it's important to understand the followi
 * **Key**: A key is a container object in the registry that can hold subkeys and values. It can designate both a root key and a subkey.
 * **Value**: A value is a named item containing data and attached to a key. Each value has a name, a data type, and the actual data. Common data types include strings (REG_SZ), binary data (REG_BINARY), and DWORDs (REG_DWORD).
 
+.. image:: basic_windows_regedit.png
+    :caption: Visual representation of those words.
+
 ********************
 Key functionnalities
 ********************
