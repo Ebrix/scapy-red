@@ -125,12 +125,11 @@ The ``cat`` function displays the values of the current key or a specified relat
       - SvcMemMidLimitInMB  (REG_DWORD - 4) 20
       - SvcMemSoftLimitInMB (REG_DWORD - 4) 11
       - Type                (REG_DWORD - 4) 32
-      -                     (REG_SZ - 1)    This is the default value
+      - (Default)           (REG_SZ - 1)    This is the default value
 
 
-Notice how the default value is represented with an empty name, when regedit shows it as "(Default)".
-This is a design choice to avoid confusion with a value that would actually be named "(Default)".
-Future development may include an option to display it as "(Default)" for better user experience.
+The default value is represented with a bold blue ``(Default)`` in a similar fashion as regedit.
+This is a design choice to avoid confusion with a value that would actually be named ``(Default)``.
 
 
 =======================================
@@ -316,7 +315,8 @@ Notice that:
   You can still use the Python API to set values with spaces in their names. Yet I agree this is not very user-friendly.
   Future versions may include a more advanced CLI parser to handle this case.
 * when setting a value that already exists, its data type is updated to the new type provided.
-* it's not currently possible to set the default value of a key via the CLI. 
+* if you want to set the default value, set the value ``(Default)``.
+* if you want to set the value ``(Default)`` but not the default value, use the parameter ``is_not_default``
 
 ========================================
 ``delete_value``: Delete a value
@@ -339,6 +339,9 @@ The ``delete_value`` function deletes a specified value under the current key or
           - string              (REG_EXPAND_SZ - 2) %APPDATA%UnicodeString
           - mydword             (REG_DWORD - 4) 12345
           - myBEdword           (REG_DWORD_BIG_ENDIAN - 5) 123451238412304
+
+
+If you want to delete the default value: do not specify anyvalue.
 
 
 ================================================

@@ -64,6 +64,7 @@ from scapy.layers.msrpce.raw.ms_rrp import (
     BaseRegOpenKey_Request,
     BaseRegEnumKey_Request,
     BaseRegEnumValue_Request,
+    BaseRegCloseKey_Request,
     BaseRegQueryValue_Request,
     BaseRegGetVersion_Request,
     BaseRegQueryInfoKey_Request,
@@ -790,7 +791,7 @@ class RegClient(CLIUtil):
     # --------------------------------------------- #
 
     @CLIUtil.addcommand()
-    def use(self, root_path):
+    def use(self, root_path: str) -> None:
         """
         Selects and sets the base registry key (root) to use for subsequent operations.
 
@@ -965,7 +966,11 @@ class RegClient(CLIUtil):
     @CLIUtil.addcommand(spaces=True)
     def ls(self, subkey: str | None = None) -> list[str]:
         """
-        EnumKeys of the current subkey path
+        Enumerate the subkeys of the given relative `subkey`
+
+        :param subkey: the relative subkey to enumerate the subkey from. If None, uses the current subkey path.
+
+        :return: the list of the subkeys.
         """
 
         # Try to use the cache
@@ -1049,16 +1054,10 @@ class RegClient(CLIUtil):
         If no subkey is specified, uses the current subkey path and caches results to avoid redundant RPC queries.
         Otherwise, enumerates values under the specified subkey path.
 
-        Args:
-            subkey (str | None): The subkey path to enumerate. If None or empty, uses the current subkey path.
+        :param subkey: the relative subkey path to enumerate. If None, uses the current subkey path.
 
-        Returns:
-            list[RegEntry]: A list of registry entries (as RegEntry objects) for the specified subkey path.
+        :return: a list of registry entries (as RegEntry objects) for the specified subkey path.
                             Returns an empty list if the handle is invalid or an error occurs during enumeration.
-
-        Side Effects:
-            - May print error messages to standard output if RPC queries fail.
-            - Updates internal cache for previously enumerated subkey paths.
         """
 
         # Try to use the cache
@@ -1162,12 +1161,25 @@ class RegClient(CLIUtil):
 
         for entry in results:
             if entry.reg_type == RegType.UNK:
-                print(
-                    f"  - {entry.reg_value:<20} {'(' + entry.reg_type.name + " - " + str(entry.reg_type.real_value) + ')':<15} {entry.reg_data}"
-                )
-            print(
-                f"  - {entry.reg_value:<20} {'(' + entry.reg_type.name + " - " + str(entry.reg_type.value) + ')':<15} {entry.reg_data}"
-            )
+                if entry.reg_value == "\x00":
+                    # Default value
+                    print(
+                        f"  -  {'\033[94;1m(Default)\033[0m':<28} {'(' + entry.reg_type.name + " - " + str(entry.reg_type.real_value) + ')':<15} {entry.reg_data}"
+                    )
+                else:
+                    print(
+                        f"  - {entry.reg_value:<20} {'(' + entry.reg_type.name + " - " + str(entry.reg_type.real_value) + ')':<15} {entry.reg_data}"
+                    )
+            else:
+                if entry.reg_value == "\x00":
+                    # Default value
+                    print(
+                        f"  - {'\033[94;1m(Default)\033[0m':<28} {'(' + entry.reg_type.name + " - " + str(entry.reg_type.real_value) + ')':<15} {entry.reg_data}"
+                    )
+                else:
+                    print(
+                        f"  - {entry.reg_value:<20} {'(' + entry.reg_type.name + " - " + str(entry.reg_type.value) + ')':<15} {entry.reg_data}"
+                    )
 
     @CLIUtil.addcomplete(cat)
     def cat_complete(self, subkey: str) -> list[str]:
@@ -1184,6 +1196,8 @@ class RegClient(CLIUtil):
     def cd(self, subkey: str) -> None:
         """
         Change current subkey path
+
+        :param subkey: the relative subkey to go to. Root keys shall not be provided here.
         """
 
         if subkey.strip() == "":
@@ -1257,6 +1271,10 @@ class RegClient(CLIUtil):
     def get_sd(self, subkey: str | None = None) -> SECURITY_DESCRIPTOR | None:
         """
         Get the security descriptor of the current subkey. SACL are not retrieve at this point (TODO).
+
+        :param: the relative subkey to get the security descriptor from. If None, it uses the current subkey path.
+
+        :return: the SECURITY_DESCRIPTOR object if all went well. None otherwise.
         """
 
         # Try to use the cache
@@ -1264,7 +1282,7 @@ class RegClient(CLIUtil):
         if handle is None:
             return None
 
-        # Log and execute
+        # Log and prepare request
         logger.debug("Getting security descriptor for %s", subkey)
         req = BaseRegGetKeySecurity_Request(
             hKey=handle,
@@ -1320,7 +1338,8 @@ class RegClient(CLIUtil):
         """
         Query information on the current subkey
 
-        :param subkey: The subkey to query. If None, it uses the current subkey path.
+        :param subkey: the relative subkey to query info from. If None, it uses the current subkey path.
+
         :return: BaseRegQueryInfoKey_Response object containing information about the subkey.
                  Returns None if the handle is invalid or an error occurs during the query.
         """
@@ -1331,7 +1350,7 @@ class RegClient(CLIUtil):
             logger.error("Could not get handle on the specified subkey.")
             return None
 
-        # Log and execute
+        # Log and prepare request
         logger.debug("Querying info for %s", subkey)
         req = BaseRegQueryInfoKey_Request(
             hKey=handle,
@@ -1399,10 +1418,19 @@ Info on key:
         value_type: RegType | str,
         value_data: str,
         subkey: str | None = None,
-    ) -> None:
+        is_not_default: bool = False,
+    ) -> bool | None:
         """
         Set a registry value in the current subkey.
         If no subkey is specified, it uses the current subkey path.
+
+        :param value_name: name of the value to set. Use "(Default)" for the default value.
+        :param value_type: type of the value to set. Can be a RegType or a string representing the type.
+        :param value_data: data of the value to set. The input will be encoded based on the type.
+        :param subkey: relative subkey to set the value in
+        :param is_not_default: if set, the value_name will not be converted to the default value in the case were it equals "(Default)".
+
+        :return: returns True if all went well, None otherwise.
         """
 
         # Validate the value type
@@ -1427,7 +1455,11 @@ Info on key:
         else:
             subkey_path = self._join_path(self.current_subkey_path, subkey)
 
-        # Log and execute
+        # look for default value
+        if value_name == "(Default)" and not is_not_default:
+            value_name = ""
+
+        # Log and prepare request
         logger.debug(
             "Setting value %s of type %s in %s",
             value_name,
@@ -1455,14 +1487,18 @@ Info on key:
             logger.error("Got status %s while setting value", hex(resp.status))
             return None
 
+        return True
+
     @CLIUtil.addcommand()
-    def create_key(self, new_key: str, subkey: str | None = None) -> None:
+    def create_key(self, new_key: str, subkey: str | None = None) -> bool | None:
         """
         Create a new key named as the specified `new_key` under the `subkey`.
         If no subkey is specified, it uses the current subkey path.
 
         :param new_key: name a the new key to create
         :param subkey: relative subkey to create the the new key
+
+        :return: returns True if all went well, None otherwise.
         """
 
         # Try to use the cache
@@ -1480,7 +1516,7 @@ Info on key:
             subkey_path = self._join_path(self.current_subkey_path, subkey)
             subkey_path = self._join_path(subkey_path, new_key)
 
-        # Log and execute
+        # Log and prepare request
         logger.debug("Creating key %s under %s", new_key, subkey_path)
         req = BaseRegCreateKey_Request(
             hKey=handle,
@@ -1505,16 +1541,20 @@ Info on key:
         if not is_status_ok(resp.status):
             logger.error("Got status %s while creating key", hex(resp.status))
             return None
+
         print(f"Key {new_key} created successfully.")
+        return True
 
     @CLIUtil.addcommand(spaces=True)
-    def delete_key(self, subkey: str | None = None) -> None:
+    def delete_key(self, subkey: str | None = None) -> bool | None:
         """
         Delete the specified subkey. If no subkey is specified, it uses the current subkey path.
         Proper same access rights are required to delete a key. By default we request MAXIMUM_ALLOWED.
         So no issue.
 
-        :param subkey: The subkey to delete. If None, it uses the current subkey path.
+        :param subkey: the relative subkey to delete. If None, it uses the current subkey path.
+
+        :return: returns True if all went well, None otherwise.
         """
 
         # Make sure that we have a backup activated
@@ -1526,7 +1566,7 @@ Info on key:
         else:
             subkey_path = self._join_path(self.current_subkey_path, subkey)
 
-        # Log and execute
+        # Log and prepare request
         logger.debug("Deleting key %s", subkey_path)
         req = BaseRegDeleteKey_Request(
             hKey=self.current_root_handle,
@@ -1550,6 +1590,7 @@ Info on key:
             return None
 
         print(f"Key {subkey} deleted successfully.")
+        return True
 
     @CLIUtil.addcomplete(delete_key)
     def delete_key_complete(self, subkey: str) -> list[str]:
@@ -1560,13 +1601,16 @@ Info on key:
         return self.ls_complete(subkey)
 
     @CLIUtil.addcommand()
-    def delete_value(self, value: str = "", subkey: str | None = None) -> None:
+    def delete_value(self, value: str = "", subkey: str | None = None) -> bool | None:
         """
         Delete the specified value.
         If no subkey is specified, it uses the current subkey path.
-        If no value is specified, it will delete the default value of the subkey, but subkey cannot be specified.
+        If no value is specified, it will delete the default value of the subkey, but subkey cannot be specified in CLI mode.
 
-        :param subkey: The subkey to delete. If None, it uses the current subkey path.
+        :param value: the value to delete.
+        :param subkey: the relative subkey which holds the value to delete. If None, it uses the current subkey path.
+
+        :return: returns True if all went well, None otherwise.
         """
 
         # Make sure that we have a backup activated
@@ -1586,7 +1630,7 @@ Info on key:
         else:
             subkey_path = self._join_path(self.current_subkey_path, subkey)
 
-        # Log and execute
+        # Log and prepare request
         logger.debug("Deleting value %s in %s", value, subkey_path)
         req = BaseRegDeleteValue_Request(
             hKey=handle,
@@ -1608,6 +1652,7 @@ Info on key:
             return None
 
         print(f"Value {value} deleted successfully.")
+        return True
 
     @CLIUtil.addcomplete(delete_value)
     def delete_value_complete(self, value: str) -> list[str]:
@@ -1635,15 +1680,18 @@ Info on key:
         output_path: str | None = None,
         subkey: str | None = None,
         fsecurity: bool = False,
-    ) -> None:
+    ) -> bool | None:
         """
         Backup the current subkey to a file. If no subkey is specified, it uses the current subkey path. If no output_path is specified,
         it will be saved in the `%WINDIR%\\System32` directory with the name of the subkey and .reg extension.
+        By default it saves the backup to a file protected so that only BA can read it.
 
         :param output_path: The path to save the backup file. If None, it defaults to the current subkey name with .reg extension.
                             If the output path ends with .reg, it uses it as is, otherwise it appends .reg to the output path.
-        :param subkey: The subkey to backup. If None, it uses the current subkey path.
-        :return: None, by default it saves the backup to a file protected so that only BA can read it.
+        :param subkey: the relative subkey to backup. If None, it uses the current subkey path.
+        :param fsecurity: do not set security descriptor of the backup. Let it be inherited from its parent folder.
+
+        :return: returns True if all went well, None otherwise.
         """
 
         # Make sure that we have a backup activated
@@ -1687,7 +1735,7 @@ Info on key:
             )
             sa.nLength = len(sa)
 
-        # Log and execute
+        # Log and prepare request
         logger.debug("Backing up %s to %s", key_to_save, output_path)
         req = BaseRegSaveKey_Request(
             hKey=handle,
@@ -1702,13 +1750,15 @@ Info on key:
         # Check the response status
         if not is_status_ok(resp.status):
             logger.error("Got status %s while backing up", hex(resp.status))
-        else:
-            logger.info(
-                "Backup of %s saved to %s.reg successful ",
-                self.current_subkey_path,
-                output_path,
-            )
-            print(f"Backup of {self.current_subkey_path} saved to {output_path}")
+            return None
+
+        logger.info(
+            "Backup of %s saved to %s.reg successful ",
+            self.current_subkey_path,
+            output_path,
+        )
+        print(f"Backup of {self.current_subkey_path} saved to {output_path}")
+        return True
 
     # --------------------------------------------- #
     #                   Operation options
@@ -1728,8 +1778,8 @@ Info on key:
         self.extra_options |= RegOptions.REG_OPTION_BACKUP_RESTORE
 
         # Log and print
-        print("Backup option activated.")
         logger.debug("Backup option activated.")
+        print("Backup option activated.")
 
         # Clear the local cache, as the backup option will change the behavior of the registry
         self._clear_all_caches()
@@ -1748,8 +1798,8 @@ Info on key:
         self.extra_options &= ~RegOptions.REG_OPTION_BACKUP_RESTORE
 
         # Log and print
-        print("Backup option deactivated.")
         logger.debug("Backup option deactivated.")
+        print("Backup option deactivated.")
 
         # Clear the local cache, as the backup option will change the behavior of the registry
         self._clear_all_caches()
@@ -1764,6 +1814,9 @@ Info on key:
         self.extra_options |= RegOptions.REG_OPTION_VOLATILE
         self.extra_options &= ~RegOptions.REG_OPTION_NON_VOLATILE
         self.use(self.current_root_path)
+
+        # Log and print
+        logger.debug("Volatile option activated.")
         print("Volatile option activated.")
 
         self._clear_all_caches()
@@ -1778,7 +1831,11 @@ Info on key:
         self.extra_options &= ~RegOptions.REG_OPTION_VOLATILE
         self.extra_options |= RegOptions.REG_OPTION_NON_VOLATILE
         self.use(self.current_root_path)
+
+        # Log and print
+        logger.debug("Volatile option deactivated.")
         print("Volatile option deactivated.")
+
         self._clear_all_caches()
 
     # --------------------------------------------- #
@@ -1796,6 +1853,7 @@ Info on key:
 
         :param subkey_path: The subkey path to get a handle on.
         :param desired_access_rights: The desired access rights for the subkey. If None, defaults to read access rights.
+
         :return: An NDRContextHandle on success, None on failure.
         """
 
@@ -1818,7 +1876,7 @@ Info on key:
                 AccessRights.KEY_READ | AccessRights.STANDARD_RIGHTS_READ
             )
 
-        # Log and execute
+        # Log and prepare request
         logger.debug(
             "Getting handle on subkey: %s with access rights: %s",
             subkey_path,
@@ -1860,6 +1918,7 @@ Info on key:
         :param subkey: The subkey path to retrieve. If None, uses the current subkey path.
         :param cache_name: The name of the cache to use. If None, does not use cache.
         :param desired_access: The desired access rights for the subkey. If None, defaults to read access rights.
+
         :return: A CacheElt object if cache_name is provided, otherwise an NDRContextHandle.
         """
 
@@ -1913,6 +1972,7 @@ Info on key:
 
         :param first_path: The first path to join.
         :param second_path: The second path to join.
+
         :return: A PureWindowsPath object representing the combined path.
         """
 
@@ -1939,6 +1999,7 @@ Info on key:
         Check if we have a root handle set.
 
         :param silent: If True, do not print any message if no root handle is set.
+
         :return: True if no root handle is set, False otherwise.
         """
 
@@ -1947,6 +2008,27 @@ Info on key:
                 print("No root key selected ! Use 'use' to use one.")
             return True
         return False
+
+    def _close_key(self, handle: NDRContextHandle) -> bool | None:
+
+        # Log and prepare request
+        logger.debug("Closing hKey %d", handle)
+        req = BaseRegCloseKey_Request(
+            hKe=handle,
+        )
+
+        # Send request
+        resp = self.client.sr1_req(req)
+
+        # Check the response status
+        if not is_status_ok(resp.status):
+            logger.error(
+                "Got status %s while getting handle on key",
+                hex(resp.status),
+            )
+            return None
+
+        return True
 
     def _clear_all_caches(self) -> None:
         """
@@ -1963,7 +2045,10 @@ Info on key:
         """
 
         logger.info("Jumping into the code for dev purpose...")
-        # pylint: disable=forgotten-debug-statement, pointless-statement
+        # pylint: disable=forgotten-debug-statement, pointless-statement, import-outside-toplevel, unused-import
+        from IPython import embed
+
+        print("type: embed()")
         breakpoint()
 
 
