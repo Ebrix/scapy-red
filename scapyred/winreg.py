@@ -1007,7 +1007,9 @@ class RegClient(CLIUtil):
             # Check the response status
             elif not is_status_ok(resp.status):
                 logger.error("Got status %s while enumerating keys", hex(resp.status))
-                self.cache["ls"].pop(subkey_path, None)
+                c_elt = self.cache["ls"].pop(subkey_path, None)
+                if c_elt is not None:
+                    self._close_key(c_elt.handle)
                 return []
 
             self.cache["ls"][subkey_path].values.append(
@@ -1101,7 +1103,9 @@ class RegClient(CLIUtil):
             # Check the response status
             elif not is_status_ok(resp.status):
                 logger.error("got status %s while enumerating values", hex(resp.status))
-                self.cache["cat"].pop(subkey_path, None)
+                c_elt = self.cache["cat"].pop(subkey_path, None)
+                if c_elt is not None:
+                    self._close_key(c_elt.handle)
                 return []
 
             # Get the value name and type
@@ -1131,7 +1135,9 @@ class RegClient(CLIUtil):
             # Check the response status
             if not is_status_ok(resp2.status):
                 logger.error("got status %s while querying value", hex(resp2.status))
-                self.cache["cat"].pop(subkey_path, None)
+                c_elt = self.cache["cat"].pop(subkey_path, None)
+                if c_elt is not None:
+                    self._close_key(c_elt.handle)
                 return []
 
             value = (
@@ -1480,7 +1486,9 @@ Info on key:
         # We remove the entry from the cache if it exists
         # Even if the response status is not OK, we want to remove it
         if subkey_path in self.cache["cat"]:
-            self.cache["cat"].pop(subkey_path, None)
+            c_elt = self.cache["cat"].pop(subkey_path, None)
+            if c_elt is not None:
+                self._close_key(c_elt.handle)
 
         # Check the response status
         if not is_status_ok(resp.status):
@@ -1533,9 +1541,13 @@ Info on key:
         # We remove the entry from the cache if it exists
         # Even if the response status is not OK, we want to remove it
         if subkey_path.parent in self.cache["ls"]:
-            self.cache["ls"].pop(subkey_path.parent, None)
+            c_elt = self.cache["ls"].pop(subkey_path.parent, None)
+            if c_elt is not None:
+                self._close_key(c_elt.handle)
         if subkey_path in self.cache["cat"]:
-            self.cache["cat"].pop(subkey_path, None)
+            c_elt = self.cache["cat"].pop(subkey_path, None)
+            if c_elt is not None:
+                self._close_key(c_elt.handle)
 
         # Check the response status
         if not is_status_ok(resp.status):
@@ -1580,9 +1592,13 @@ Info on key:
         # We remove the entry from the cache if it exists
         # Even if the response status is not OK, we want to remove it
         if subkey_path.parent in self.cache["ls"]:
-            self.cache["ls"].pop(subkey_path.parent, None)
+            c_elt = self.cache["ls"].pop(subkey_path.parent, None)
+            if c_elt is not None:
+                self._close_key(c_elt.handle)
         if subkey_path in self.cache["cat"]:
-            self.cache["cat"].pop(subkey_path, None)
+            c_elt = self.cache["cat"].pop(subkey_path, None)
+            if c_elt is not None:
+                self._close_key(c_elt.handle)
 
         # Check the response status
         if not is_status_ok(resp.status):
@@ -1644,7 +1660,9 @@ Info on key:
         # We remove the entry from the cache if it exists
         # Even if the response status is not OK, we want to remove it
         if subkey_path in self.cache["cat"]:
-            self.cache["cat"].pop(subkey_path, None)
+            c_elt = self.cache["cat"].pop(subkey_path, None)
+            if c_elt is not None:
+                self._close_key(c_elt.handle)
 
         # Check the response status
         if not is_status_ok(resp.status):
@@ -2012,9 +2030,10 @@ Info on key:
     def _close_key(self, handle: NDRContextHandle) -> bool | None:
 
         # Log and prepare request
-        logger.debug("Closing hKey %d", handle)
+        logger.debug("Closing hKey %s - %s", handle.uuid, handle.uuid.hex())
         req = BaseRegCloseKey_Request(
-            hKe=handle,
+            hKey=handle,
+            ndr64=True,
         )
 
         # Send request
@@ -2036,6 +2055,8 @@ Info on key:
         """
 
         for _, c in self.cache.items():
+            for c_elt in c.values():
+                self._close_key(c_elt.handle)
             c.clear()
 
     @CLIUtil.addcommand()

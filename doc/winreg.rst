@@ -51,6 +51,8 @@ The available root keys are:
     >>> scapy-winreg  --UPN Administrator@DOM.LOCAL --password Passw0rd 10.0.0.10 --rootKey HKLM
     >>> [reg] HKLM\. >
 
+This activation empties the cache of the handles.
+
 ====================
 ``ls``: List subkeys
 ====================
@@ -351,6 +353,8 @@ If you want to delete the default value: do not specify anyvalue.
 The ``activate_backup`` function activates the SeBackupPrivilege on the current session.
 This privilege is required to perform certain operations, such as saving the registry to a file or most operations which modify the registry.
 If you get an "Access Denied" error while performing such operations, try activating the backup privilege first.
+
+This activation empties the cache of the handles to avoid any conflict with the new privilege.
 
 You can disable it via ``disable_backup`` function.
 
