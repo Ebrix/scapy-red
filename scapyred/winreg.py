@@ -244,7 +244,7 @@ class RegClient(CLIUtil):
             self.client.connect(
                 target,
                 timeout=self.timeout,
-                smb_kwargs={"debug": debug},
+                smb_kwargs={"debug": debug > 1 and debug},
             )
             self.client.bind()
         except ValueError as exc:
@@ -257,7 +257,7 @@ class RegClient(CLIUtil):
             self.client.connect(
                 target,
                 timeout=self.timeout,
-                smb_kwargs={"debug": debug},
+                smb_kwargs={"debug": debug > 1 and debug},
             )
             self.client.bind()
         except Scapy_Exception as exc:
