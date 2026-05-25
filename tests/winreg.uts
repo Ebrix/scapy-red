@@ -36,7 +36,7 @@ for root_key in ["HKLM", "HKCU", "HKCR", "HKU", "HKCC"]:
     print(f"Switched to root key: {root_key} with result: {result}")
     assert result is not None
     print(result.ls())
-assert False
+
 
 # Test with an invalid root key
 try:
@@ -51,7 +51,7 @@ client.use("HKLM")
 = WinReg - Test cd method of RegClient
 
 # Change to a valid subkey
-result = client.cd("\\SOFTWARE\\Microsoft\\Windows\\")
+result = client.cd("\\SOFTWARE\\Microsoft\\Windows")
 result = client.cd("..")
 result = client.cd("Windows\\CurrentVersion")
 result = client.cd("\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion")
