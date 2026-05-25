@@ -9,13 +9,12 @@ Windows Registry Client over RPC
 
 import os
 import logging
-import sys
+import pathlib
 
 from dataclasses import dataclass
 from enum import IntFlag, Enum
 from ctypes.wintypes import PFILETIME
 from typing import NoReturn, Self
-from pathlib import PureWindowsPath
 from datetime import datetime, timezone
 from time import sleep
 
@@ -303,7 +302,7 @@ UPN = "Administrator@192.168.1.2"
         self.current_root_handle = None
         self.current_subkey_handle = None
         self.expl_mode = False
-        self.current_subkey_path: PureWindowsPath = PureWindowsPath("")
+        self.pwd = pathlib.PureWindowsPath("/")
         self.sam_requested_access_rights = 0x2000000  # Maximum Allowed
         if rootKey in AVAILABLE_ROOT_KEYS:
             self.current_root_path = rootKey.strip()
@@ -316,7 +315,7 @@ UPN = "Administrator@192.168.1.2"
             self.loop(debug=debug)
 
     def ps1(self) -> str:
-        return f"[reg] {self.current_root_path}\\{self.current_subkey_path} > "
+        return f"[reg] {self.current_root_path}\\{self.pwd} > "
 
     @CLIUtil.addcommand()
     def close(self) -> None:
@@ -416,7 +415,7 @@ UPN = "Administrator@192.168.1.2"
         if subkey is None:
             subkey = ""
 
-        subkey_path = self._join_path(self.current_subkey_path, subkey)
+        subkey_path = self.normalize_path(self.pwd / subkey)
 
         # Enumerate the subkeys
         log_runtime.debug("Enumerating subkeys at %s", subkey_path)
@@ -451,15 +450,10 @@ UPN = "Administrator@192.168.1.2"
         if self._require_root_handles(silent=True):
             return []
 
-        subkey = subkey.strip().replace("/", "\\")
-        if "\\" in subkey:
-            parent = "\\".join(subkey.split("\\")[:-1])
-            subkey = subkey.split("\\")[-1]
-        else:
-            parent = ""
+        parent = self.pwd / (subkey or "")
 
         return [
-            str(self._join_path(parent, str(subk)))
+            self.normalize_path(parent / subk)
             for subk in self.ls(parent)
             if str(subk).lower().startswith(subkey.lower())
         ]
@@ -490,7 +484,7 @@ UPN = "Administrator@192.168.1.2"
             # no need to query again the RPC
             return res.values
 
-        subkey_path = self._join_path(self.current_subkey_path, subkey)
+        subkey_path = self.normalize_path(self.pwd / subkey)
 
         log_runtime.debug("Enumerating values from the %s subkey", subkey_path)
         try:
@@ -571,11 +565,10 @@ UPN = "Administrator@192.168.1.2"
             not be provided here.
         """
 
-        if subkey.strip() == "":
-            # If the subkey is ".", we do not change the current subkey path
-            tmp_path = PureWindowsPath()
+        if not subkey.strip():
+            # go to root
+            tmp_path = pathlib.PureWindowsPath()
             tmp_handle = self.get_handle_on_subkey(tmp_path)
-
         else:
             # Try to use the cache
             res = self._get_cached_elt(
@@ -583,12 +576,12 @@ UPN = "Administrator@192.168.1.2"
                 cache_name="cd",
             )
             tmp_handle = res.handle if res else None
-            tmp_path = self._join_path(self.current_subkey_path, subkey)
+            tmp_path = self.collapse_path(self.pwd / subkey)
 
         if tmp_handle is not None:
             # If the handle was successfully retrieved,
             # we update the current subkey path and handle
-            self.current_subkey_path = tmp_path
+            self.pwd = tmp_path
             self.current_subkey_handle = tmp_handle
         else:
             log_runtime.error("Could not change directory to %s", subkey)
@@ -596,7 +589,7 @@ UPN = "Administrator@192.168.1.2"
 
         if self.expl_mode:
             # force the trigger of the UTILS.OUTPUT command (cd_output)
-            return f"[{self.current_root_path}:\\{self.current_subkey_path}]"
+            return f"[{self.current_root_path}:\\{self.pwd}]"
 
     @CLIUtil.addcomplete(cd)
     def cd_complete(self, subkey: str) -> list[str]:
@@ -824,9 +817,9 @@ Info on key:
             return None
 
         if subkey is None:
-            subkey_path = self.current_subkey_path
+            subkey_path = self.pwd
         else:
-            subkey_path = self._join_path(self.current_subkey_path, subkey)
+            subkey_path = self.normalize_path(self.pwd / subkey)
 
         # look for default value
         if value_name == "(Default)" and not is_not_default:
@@ -986,14 +979,12 @@ Info on key:
             log_runtime.error("Could not get handle on the specified subkey.")
             return None
 
-        if subkey is None:
-            subkey_path = self._join_path(self.current_subkey_path, new_key)
-        else:
-            subkey_path = self._join_path(self.current_subkey_path, subkey)
-            subkey_path = self._join_path(subkey_path, new_key)
+        parent = self.collapse_path(self.pwd / (subkey or ""))
+        parent_path = self.normalize_path(parent)
+        subkey_path = self.normalize_path(parent / new_key)
 
         # Log and send request
-        log_runtime.debug("Creating key %s under %s", new_key, subkey_path)
+        log_runtime.debug("Creating key %s under %s", new_key, parent)
 
         try:
             self.client.create_subkey(
@@ -1010,8 +1001,8 @@ Info on key:
             )
             # We remove the entry from the cache if it exists
             # Even if the response status is not OK, we want to remove it
-            if subkey_path.parent in self.cache["ls"]:
-                c_elt = self.cache["ls"].pop(subkey_path.parent, None)
+            if parent_path in self.cache["ls"]:
+                c_elt = self.cache["ls"].pop(parent_path, None)
                 if c_elt is not None:
                     self._close_key(c_elt.handle)
             if subkey_path in self.cache["cat"]:
@@ -1021,8 +1012,8 @@ Info on key:
             return None
 
         # We remove the entry from the cache if it exists
-        if subkey_path.parent in self.cache["ls"]:
-            c_elt = self.cache["ls"].pop(subkey_path.parent, None)
+        if parent_path in self.cache["ls"]:
+            c_elt = self.cache["ls"].pop(parent_path, None)
             if c_elt is not None:
                 self._close_key(c_elt.handle)
         if subkey_path in self.cache["cat"]:
@@ -1051,10 +1042,9 @@ Info on key:
         self.backup(activate=True)
 
         # Determine the subkey path for logging and cache purposes
-        if subkey is None:
-            subkey_path = self.current_subkey_path
-        else:
-            subkey_path = self._join_path(self.current_subkey_path, subkey)
+        subkey = self.collapse_path(self.pwd / (subkey or ""))
+        parent_path = self.normalize_path(subkey.parent)
+        subkey_path = self.normalize_path(subkey)
 
         # Log and prepare request
         log_runtime.debug("Deleting key %s", subkey_path)
@@ -1070,8 +1060,8 @@ Info on key:
             )
             # Even if the response status is not OK, we want to remove it
             # the entry from the cache if it exists
-            if subkey_path.parent in self.cache["ls"]:
-                c_elt = self.cache["ls"].pop(subkey_path.parent, None)
+            if parent_path in self.cache["ls"]:
+                c_elt = self.cache["ls"].pop(parent_path, None)
                 if c_elt is not None:
                     self._close_key(c_elt.handle)
             if subkey_path in self.cache["cat"]:
@@ -1082,8 +1072,8 @@ Info on key:
 
         # We remove the entry from the cache if it exists
         # Even if the response status is not OK, we want to remove it
-        if subkey_path.parent in self.cache["ls"]:
-            c_elt = self.cache["ls"].pop(subkey_path.parent, None)
+        if parent_path in self.cache["ls"]:
+            c_elt = self.cache["ls"].pop(parent_path, None)
             if c_elt is not None:
                 self._close_key(c_elt.handle)
         if subkey_path in self.cache["cat"]:
@@ -1126,10 +1116,7 @@ Info on key:
             return None
 
         # Determine the subkey path for logging and cache purposes
-        if subkey is None:
-            subkey_path = self.current_subkey_path
-        else:
-            subkey_path = self._join_path(self.current_subkey_path, subkey)
+        subkey_path = self.normalize_path(self.pwd / (subkey or ""))
 
         # Log and prepare request
         log_runtime.debug("Deleting value %s in %s", value, subkey_path)
@@ -1202,9 +1189,9 @@ Info on key:
         By default it saves the backup to a file protected so that only BA can read it.
 
         :param output_path: The path to save the backup file. If None, it defaults
-                            to the current subkey name with .reg extension.
-                            If the output path ends with .reg, it uses it as is,
-                            otherwise it appends .reg to the output path.
+            to the current subkey name with .reg extension. If the output path ends
+            with .reg, it will consider it's a file, otherwise it is considered as
+            a folder path.
         :param subkey: the relative subkey to backup. If None, it uses the
                             current subkey path.
         :param fsecurity: do not set security descriptor of the backup. Let it be
@@ -1218,9 +1205,7 @@ Info on key:
 
         # Try to use the cache
         handle = self._get_cached_elt(subkey=subkey)
-        key_to_save = (
-            subkey.split("\\")[-1] if subkey else self.current_subkey_path.name
-        )
+        key_to_save = subkey.split("\\")[-1] if subkey else self.pwd.name
 
         if handle is None:
             log_runtime.error("Could not get handle on the specified subkey.")
@@ -1229,14 +1214,14 @@ Info on key:
         # Default path is %WINDIR%\System32
         if output_path is None:
             output_path = str(key_to_save) + ".reg"
-
         elif output_path.endswith(".reg"):
             # If the output path ends with .reg, we use it as is
-            output_path = str(self._join_path("", output_path))
-
+            output_path = self.normalize_path(output_path)
         else:
             # Otherwise, we use the current subkey path as the output path
-            output_path = str(self._join_path(output_path, str(key_to_save) + ".reg"))
+            output_path = self.normalize_path(
+                pathlib.PureWindowsPath(output_path) / (str(key_to_save) + ".reg")
+            )
 
         if fsecurity:
             print(
@@ -1265,10 +1250,10 @@ Info on key:
 
         log_runtime.info(
             "Backup of %s saved to %s.reg successful ",
-            self.current_subkey_path,
+            self.pwd,
             output_path,
         )
-        print(f"Backup of {self.current_subkey_path} saved to {output_path}")
+        print(f"Backup of {self.pwd} saved to {output_path}")
         return True
 
     # --------------------------------------------- #
@@ -1335,7 +1320,7 @@ Info on key:
 
     def get_handle_on_subkey(
         self,
-        subkey_path: PureWindowsPath,
+        subkey_path: pathlib.PureWindowsPath,
         desired_access_rights: IntFlag | None = None,
     ) -> NDRContextHandle | None:
         """
@@ -1408,15 +1393,7 @@ Info on key:
             # Default to read access rights
             desired_access = 0x20019  # KEY_READ | STANDARD_RIGHTS_READ
 
-        # If no specific subkey was specified
-        # we use our current subkey path
-        if subkey is None or subkey == "" or subkey == ".":
-            subkey_path = self.current_subkey_path
-
-        # Otherwise we use the subkey path,
-        # the calling parent shall make sure that this path was properly sanitized
-        else:
-            subkey_path = self._join_path(self.current_subkey_path, subkey)
+        subkey_path = self.normalize_path(self.pwd / (subkey or ""))
 
         # If cache name is specified, we try to use it
         if (
@@ -1441,37 +1418,16 @@ Info on key:
 
         return cache_elt if cache_name is not None else handle
 
-    def _join_path(
-        self, first_path: str | None, second_path: str | None
-    ) -> PureWindowsPath:
+    def collapse_path(self, path):
+        # the amount of pathlib.wtf you need to do to resolve .. on all platforms
+        # is ridiculous
+        return pathlib.PureWindowsPath(os.path.normpath(path.as_posix()))
+
+    def normalize_path(self, path):
         """
-        Join two paths in a way that is compatible with Windows paths.
-        This ensures that the paths are normalized and combined correctly,
-        even if they are provided as strings or PureWindowsPath objects.
-
-        :param first_path: The first path to join.
-        :param second_path: The second path to join.
-
-        :return: A PureWindowsPath object representing the combined path.
+        Normalize path for CIFS usage
         """
-
-        if first_path is None:
-            first_path = ""
-        if second_path is None:
-            second_path = ""
-        if str(PureWindowsPath(second_path).as_posix()).startswith("/"):
-            # If the second path is an absolute path, we return it as is
-            return PureWindowsPath(
-                os.path.normpath(PureWindowsPath(second_path).as_posix()).lstrip("/")
-            )
-        return PureWindowsPath(
-            os.path.normpath(
-                os.path.join(
-                    PureWindowsPath(first_path).as_posix(),
-                    PureWindowsPath(second_path).as_posix(),
-                )
-            )
-        )
+        return str(self.collapse_path(path)).lstrip("\\")
 
     def _require_root_handles(self, silent: bool = False) -> bool:
         """

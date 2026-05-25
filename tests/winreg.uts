@@ -50,16 +50,15 @@ except ValueError:
 client.use("HKLM")
 
 # Change to a valid subkey
-result = client.cd("SOFTWARE\\Microsoft\\Windows")
+result = client.cd("\\SOFTWARE\\Microsoft\\Windows")
 result = client.cd("..")
 result = client.cd("Windows\\CurrentVersion")
-result = client.cd("SOFTWARE\\Microsoft\\Windows\\CurrentVersion")
-print(
-    f"Changed directory to SOFTWARE\\Microsoft\\Windows\\CurrentVersion with result: {result}"
-)
-assert client.current_subkey_path == PureWindowsPath(
-    "SOFTWARE/Microsoft/Windows/CurrentVersion"
-)
+# Unix-style
+result = client.cd("/SOFTWARE/Microsoft/Windows/CurrentVersion")
+print(f"Changed directory to SOFTWARE\\Microsoft\\Windows\\CurrentVersion with result: {result}")
+
+print(client.pwd)
+assert client.pwd == PureWindowsPath("/SOFTWARE/Microsoft/Windows/CurrentVersion")
 
 # Attempt to change to an invalid subkey
 try:
