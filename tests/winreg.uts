@@ -45,16 +45,15 @@ try:
 except ValueError:
     pass
 
-# Return the client for further tests
-client.use("HKLM")
-
 = WinReg - Test cd method of RegClient
 
+client.use("HKLM")
+
 # Change to a valid subkey
-result = client.cd("\\SOFTWARE\\Microsoft\\Windows")
+result = client.cd("SOFTWARE\\Microsoft\\Windows")
 result = client.cd("..")
 result = client.cd("Windows\\CurrentVersion")
-result = client.cd("\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion")
+result = client.cd("SOFTWARE\\Microsoft\\Windows\\CurrentVersion")
 print(
     f"Changed directory to SOFTWARE\\Microsoft\\Windows\\CurrentVersion with result: {result}"
 )
@@ -69,9 +68,9 @@ try:
 except ValueError:
     pass
 
-client.cd("")
-
 = WinReg - Test ls method of RegClient
+
+client.cd("")
 
 # List subkeys and values in the current directory
 list_of_first_subkeys = client.ls()
