@@ -243,3 +243,5 @@ assert client.save(output_path="C:\\", subkey="SOFTWARE")
 = WinReg - Close client
 
 client.close()
+
+# vim: ft=python:ts=4:sw=4
