@@ -9,13 +9,13 @@ Windows Registry Client over RPC
 
 import os
 import logging
+import pathlib
 
 from dataclasses import dataclass
 from enum import IntFlag, Enum
 from ctypes.wintypes import PFILETIME
 from typing import NoReturn, Self
 from datetime import datetime, timezone
-from pathlib import PureWindowsPath
 from time import sleep
 
 # Load scapy-rpc
@@ -302,7 +302,7 @@ UPN = "Administrator@192.168.1.2"
         self.current_root_handle = None
         self.current_subkey_handle = None
         self.expl_mode = False
-        self.pwd = PureWindowsPath("/")
+        self.pwd = pathlib.PureWindowsPath("/")
         self.sam_requested_access_rights = 0x2000000  # Maximum Allowed
         if rootKey in AVAILABLE_ROOT_KEYS:
             self.current_root_path = rootKey.strip()
@@ -315,7 +315,7 @@ UPN = "Administrator@192.168.1.2"
             self.loop(debug=debug)
 
     def ps1(self) -> str:
-        return f"[reg] {self.current_root_path}\\{self.pwd} > "
+        return f"[reg] {self.current_root_path}{self.pwd} > "
 
     @CLIUtil.addcommand()
     def close(self) -> None:
@@ -409,30 +409,27 @@ UPN = "Administrator@192.168.1.2"
         elif len(res.values) != 0:
             # If the resolution was already performed,
             # no need to query again the RPC
-            return res.values
+            values = res.values
+        else:
+            # Enumerate the subkeys
+            subkey_str = self.normalize_path(self.pwd / (subkey or ""))
+            log_runtime.debug("Enumerating subkeys at %s", subkey_str)
 
-        # format subkey as a string to get a subkey path
-        if subkey is None:
-            subkey = ""
+            try:
+                subkeys = self.client.enum_subkeys(res.handle, timeout=self.timeout)
+                self.cache["ls"][subkey_str].values.extend(subkeys)
+            except ValueError as resp_exc:
+                log_runtime.error(
+                    "Got status %s while enumerating keys", hex(int(resp_exc.args[0]))
+                )
+                c_elt = self.cache["ls"].pop(subkey_str, None)
+                if c_elt is not None:
+                    self._close_key(c_elt.handle)
+                return []
 
-        subkey_path = self.normalize_path(self.pwd / subkey)
+            values = self.cache["ls"][subkey_str].values
 
-        # Enumerate the subkeys
-        log_runtime.debug("Enumerating subkeys at %s", subkey_path)
-
-        try:
-            subkeys = self.client.enum_subkeys(res.handle, timeout=self.timeout)
-            self.cache["ls"][subkey_path].values.extend(subkeys)
-        except ValueError as resp_exc:
-            log_runtime.error(
-                "Got status %s while enumerating keys", hex(int(resp_exc.args[0]))
-            )
-            c_elt = self.cache["ls"].pop(subkey_path, None)
-            if c_elt is not None:
-                self._close_key(c_elt.handle)
-            return []
-
-        return self.cache["ls"][subkey_path].values
+        return values
 
     @CLIUtil.addoutput(ls)
     def ls_output(self, results: list[str]) -> None:
@@ -442,37 +439,34 @@ UPN = "Administrator@192.168.1.2"
         for subkey in results:
             print(subkey)
 
+    def _parsepath(self, arg, remote=True):
+        """
+        Parse a path. Returns the parent folder and file name
+        """
+        # Find parent directory if it exists
+        elt = (pathlib.PureWindowsPath if remote else pathlib.Path)(arg)
+        eltpar = (pathlib.PureWindowsPath if remote else pathlib.Path)(".")
+        eltname = elt.name
+        if arg.endswith("/") or arg.endswith("\\"):
+            eltpar = elt
+            eltname = ""
+        elif elt.parent and elt.parent.name or elt.is_absolute():
+            eltpar = elt.parent
+        return eltpar, eltname
+
     @CLIUtil.addcomplete(ls)
-    def ls_complete(self, subkey: str) -> list[str]:
+    def ls_complete(self, arg: str) -> list[str]:
         """
-        Auto-complete ls
+        Return a listing of the remote keys for completion purposes
         """
-        if self._require_root_handles(silent=True):
+        eltpar, eltname = self._parsepath(arg)
+        # ls in that directory
+        try:
+            results = self.ls(subkey=eltpar)
+        except ValueError:
             return []
-
-        # Trailing slash means the path itself is the directory
-        if subkey.endswith("/") or subkey.endswith("\\"):
-            parent_dir = PureWindowsPath(subkey)
-            subkey = ""
-
-        if subkey.startswith("/") or subkey.startswith("\\"):
-            parent_dir = PureWindowsPath(subkey)
-            subkey = ""
-        else:
-            parent_dir = PureWindowsPath(subkey).parent
-            subkey = str(PureWindowsPath(subkey).name)
-
-        # # parent = self.collapse_path(self.pwd / (subkey or "")).parent
-        # print(
-        #     f"parent_dir: {parent_dir}, self.pwd: {self.pwd}, subkey: >{subkey}< {type(subkey)}"
-        # )
-        # print([self.ls(parent_dir)])
-        # print(subkey.lower())
-        # print([str(subk).lower() for subk in self.ls(parent_dir)])
         return [
-            self.normalize_path(parent_dir / subk)
-            for subk in self.ls(parent_dir)
-            if str(subk).lower().startswith(subkey.lower())
+            str(eltpar / x) for x in results if x.lower().startswith(eltname.lower())
         ]
 
     @CLIUtil.addcommand(mono=True)
@@ -584,7 +578,7 @@ UPN = "Administrator@192.168.1.2"
 
         if not subkey.strip():
             # go to root
-            tmp_path = PureWindowsPath()
+            tmp_path = pathlib.PureWindowsPath("/")
             tmp_handle = self.get_handle_on_subkey(tmp_path)
         else:
             # Try to use the cache
@@ -1237,7 +1231,7 @@ Info on key:
         else:
             # Otherwise, we use the current subkey path as the output path
             output_path = self.normalize_path(
-                PureWindowsPath(output_path) / (str(key_to_save) + ".reg")
+                pathlib.PureWindowsPath(output_path) / (str(key_to_save) + ".reg")
             )
 
         if fsecurity:
@@ -1337,7 +1331,7 @@ Info on key:
 
     def get_handle_on_subkey(
         self,
-        subkey_path: PureWindowsPath,
+        subkey_path: pathlib.PureWindowsPath,
         desired_access_rights: IntFlag | None = None,
     ) -> NDRContextHandle | None:
         """
@@ -1365,7 +1359,7 @@ Info on key:
         try:
             resp_handle = self.client.get_subkey_handle(
                 self.current_root_handle,
-                subkey_path,
+                self.normalize_path(subkey_path),
                 desired_access_rights=desired_access_rights,
                 options=self.extra_options,
                 timeout=self.timeout,
@@ -1410,32 +1404,33 @@ Info on key:
             # Default to read access rights
             desired_access = 0x20019  # KEY_READ | STANDARD_RIGHTS_READ
 
-        subkey_path = self.normalize_path(self.pwd / (subkey or ""))
+        subkey_path = self.collapse_path(self.pwd / (subkey or ""))
+        subkey_str = self.normalize_path(subkey_path)
 
         # If cache name is specified, we try to use it
         if (
             self.cache.get(cache_name, None) is not None
-            and self.cache[cache_name].get(subkey_path, None) is not None
-            and self.cache[cache_name][subkey_path].access == desired_access
+            and self.cache[cache_name].get(subkey_str, None) is not None
+            and self.cache[cache_name][subkey_str].access == desired_access
         ):
             # If we have a cache, we check if the handle is already cached
             # If the access rights are the same, we return the cached elt
-            return self.cache[cache_name][subkey_path]
+            return self.cache[cache_name][subkey_str]
 
         # Otherwise, we need to get a new handle on the subkey
         handle = self.get_handle_on_subkey(subkey_path, desired_access)
         if handle is None:
-            log_runtime.error("Could not get handle on %s", subkey_path)
+            log_runtime.error("Could not get handle on %s", subkey_str)
             return None
 
         # If we have a cache name, we store the handle in the cache
         cache_elt = CacheElt(handle, desired_access, [])
         if cache_name is not None:
-            self.cache[cache_name][subkey_path] = cache_elt
+            self.cache[cache_name][subkey_str] = cache_elt
 
         return cache_elt if cache_name is not None else handle
 
-    def collapse_path(self, path: PureWindowsPath) -> PureWindowsPath:
+    def collapse_path(self, path: pathlib.PureWindowsPath) -> pathlib.PureWindowsPath:
         """
         Collapse a Windows path by resolving any '..' components and normalizing whichever the
         platform style.
@@ -1450,9 +1445,9 @@ Info on key:
             PureWindowsPath('/azerar')
         """
 
-        return PureWindowsPath(os.path.normpath(path.as_posix()))
+        return pathlib.PureWindowsPath(os.path.normpath(path.as_posix()))
 
-    def normalize_path(self, path: PureWindowsPath) -> str:
+    def normalize_path(self, path: pathlib.PureWindowsPath) -> str:
         """
         Normalize path for CIFS usage
         """
