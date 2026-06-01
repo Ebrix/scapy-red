@@ -417,18 +417,15 @@ UPN = "Administrator@192.168.1.2"
 
             try:
                 subkeys = self.client.enum_subkeys(res.handle, timeout=self.timeout)
-                self.cache["ls"][subkey_str].values.extend(subkeys)
+                self._add_to_cache("ls", subkey_str, subkeys)
             except ValueError as resp_exc:
                 log_runtime.error(
                     "Got status %s while enumerating keys", hex(int(resp_exc.args[0]))
                 )
-                c_elt = self.cache["ls"].pop(subkey_str, None)
-                if c_elt is not None:
-                    self._close_key(c_elt.handle)
+                self._remove_from_cache("ls", subkey_str)
                 return []
 
             values = self.cache["ls"][subkey_str].values
-
         return values
 
     @CLIUtil.addoutput(ls)
@@ -500,14 +497,12 @@ UPN = "Administrator@192.168.1.2"
         log_runtime.debug("Enumerating values from the %s subkey", subkey_path)
         try:
             entries = self.client.enum_values(res.handle, timeout=self.timeout)
-            self.cache["cat"][subkey_path].values.extend(entries)
+            self._add_to_cache("cat", subkey_path, entries)
         except ValueError as resp_exc:
             log_runtime.error(
                 "got status %s while enumerating values", hex(int(resp_exc.args[0]))
             )
-            c_elt = self.cache["cat"].pop(subkey_path, None)
-            if c_elt is not None:
-                self._close_key(c_elt.handle)
+            self._remove_from_cache("cat", subkey_path)
             return []
 
         return self.cache["cat"][subkey_path].values
@@ -595,7 +590,6 @@ UPN = "Administrator@192.168.1.2"
             self.pwd = tmp_path
             self.current_subkey_handle = tmp_handle
         else:
-            log_runtime.error("Could not change directory to %s", subkey)
             raise ValueError(f"Could not change directory to {subkey}")
 
         if self.expl_mode:
@@ -660,17 +654,10 @@ UPN = "Administrator@192.168.1.2"
 
         # Log and prepare request
         log_runtime.debug("Getting security descriptor for %s", subkey)
-
-        try:
-            sd = self.client.get_key_security(
-                handle,
-                timeout=self.timeout,
-            )
-        except ValueError as resp_exc:
-            log_runtime.error(
-                "Got status %s while getting security", hex(resp_exc.args[0])
-            )
-            return None
+        sd = self.client.get_key_security(
+            handle,
+            timeout=self.timeout,
+        )
 
         return sd
 
@@ -716,13 +703,7 @@ UPN = "Administrator@192.168.1.2"
 
         # Log and request info
         log_runtime.debug("Querying info for %s", subkey)
-        try:
-            resp = self.client.get_key_info(handle, timeout=self.timeout)
-        except ValueError as resp_exc:
-            log_runtime.error(
-                "Got status %s while querying info", hex(int(resp_exc.args[0]))
-            )
-            return None
+        resp = self.client.get_key_info(handle, timeout=self.timeout)
 
         return resp
 
@@ -882,19 +863,12 @@ Info on key:
             )
             # We remove the entry from the cache if it exists
             # Even if the response status is not OK, we want to remove it
-            if subkey_path in self.cache["cat"]:
-                c_elt = self.cache["cat"].pop(subkey_path, None)
-                if c_elt is not None:
-                    self._close_key(c_elt.handle)
-            return None
+            self._remove_from_cache("cat", subkey_path)
+            raise resp_exc
 
         # We remove the entry from the cache if it exists
         # Even if the response status is not OK, we want to remove it
-        if subkey_path in self.cache["cat"]:
-            c_elt = self.cache["cat"].pop(subkey_path, None)
-            if c_elt is not None:
-                self._close_key(c_elt.handle)
-
+        self._remove_from_cache("cat", subkey_path)
         return True
 
     @CLIUtil.addcomplete(set_value)
@@ -1012,25 +986,13 @@ Info on key:
             )
             # We remove the entry from the cache if it exists
             # Even if the response status is not OK, we want to remove it
-            if parent_path in self.cache["ls"]:
-                c_elt = self.cache["ls"].pop(parent_path, None)
-                if c_elt is not None:
-                    self._close_key(c_elt.handle)
-            if subkey_path in self.cache["cat"]:
-                c_elt = self.cache["cat"].pop(subkey_path, None)
-                if c_elt is not None:
-                    self._close_key(c_elt.handle)
-            return None
+            self._remove_from_cache("ls", parent_path)
+            self._remove_from_cache("cat", subkey_path)
+            raise resp_exc
 
         # We remove the entry from the cache if it exists
-        if parent_path in self.cache["ls"]:
-            c_elt = self.cache["ls"].pop(parent_path, None)
-            if c_elt is not None:
-                self._close_key(c_elt.handle)
-        if subkey_path in self.cache["cat"]:
-            c_elt = self.cache["cat"].pop(subkey_path, None)
-            if c_elt is not None:
-                self._close_key(c_elt.handle)
+        self._remove_from_cache("ls", parent_path)
+        self._remove_from_cache("cat", subkey_path)
 
         print(f"Key {new_key} created successfully.")
         return True
@@ -1071,26 +1033,14 @@ Info on key:
             )
             # Even if the response status is not OK, we want to remove it
             # the entry from the cache if it exists
-            if parent_path in self.cache["ls"]:
-                c_elt = self.cache["ls"].pop(parent_path, None)
-                if c_elt is not None:
-                    self._close_key(c_elt.handle)
-            if subkey_path in self.cache["cat"]:
-                c_elt = self.cache["cat"].pop(subkey_path, None)
-                if c_elt is not None:
-                    self._close_key(c_elt.handle)
-            return None
+            self._remove_from_cache("ls", parent_path)
+            self._remove_from_cache("cat", subkey_path)
+            raise resp_exc
 
         # We remove the entry from the cache if it exists
         # Even if the response status is not OK, we want to remove it
-        if parent_path in self.cache["ls"]:
-            c_elt = self.cache["ls"].pop(parent_path, None)
-            if c_elt is not None:
-                self._close_key(c_elt.handle)
-        if subkey_path in self.cache["cat"]:
-            c_elt = self.cache["cat"].pop(subkey_path, None)
-            if c_elt is not None:
-                self._close_key(c_elt.handle)
+        self._remove_from_cache("ls", parent_path)
+        self._remove_from_cache("cat", subkey_path)
 
         print(f"Key {subkey} deleted successfully.")
         return True
@@ -1144,18 +1094,11 @@ Info on key:
             )
             # Even if the response status is not OK, we want to remove it
             # the entry from the cache if it exists
-            if subkey_path in self.cache["cat"]:
-                c_elt = self.cache["cat"].pop(subkey_path, None)
-                if c_elt is not None:
-                    self._close_key(c_elt.handle)
-            return None
+            self._remove_from_cache("cat", subkey_path)
+            raise resp_exc
 
         # We remove the entry from the cache if it exists
-        if subkey_path in self.cache["cat"]:
-            c_elt = self.cache["cat"].pop(subkey_path, None)
-            if c_elt is not None:
-                self._close_key(c_elt.handle)
-
+        self._remove_from_cache("cat", subkey_path)
         print(f"Value {value} deleted successfully.")
         return True
 
@@ -1370,9 +1313,22 @@ Info on key:
                 hex(int(resp_exc.args[0])),
                 subkey_path,
             )
-            return None
+            raise resp_exc
 
         return resp_handle
+
+    def _add_to_cache(self, cache_type: str, subkey_path: str, values):
+        self.cache[cache_type][subkey_path].values.extend(values)
+
+    def _remove_from_cache(self, cache_type: str | list, subkey_path: str):
+        if isinstance(cache_type, str):
+            cache_type = [cache_type]
+        for t in cache_type:
+            to_remove = [x for x in self.cache[t] if x.upper() == subkey_path.upper()]
+            for x in to_remove:
+                c_elt = self.cache[t].pop(x, None)
+                if c_elt is not None:
+                    self._close_key(c_elt.handle)
 
     def _get_cached_elt(
         self,
@@ -1471,14 +1427,7 @@ Info on key:
 
         # Log and close
         log_runtime.debug("Closing hKey %s - %s", handle.uuid, handle.uuid.hex())
-        try:
-            self.client.close_key(handle, timeout=self.timeout)
-        except ValueError as resp_exc:
-            log_runtime.error(
-                "Got status %s while closing key", hex(int(resp_exc.args[0]))
-            )
-            return None
-
+        self.client.close_key(handle, timeout=self.timeout)
         return True
 
     @CLIUtil.addcommand()
