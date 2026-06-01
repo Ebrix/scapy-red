@@ -1432,8 +1432,7 @@ Info on key:
 
     def collapse_path(self, path: pathlib.PureWindowsPath) -> pathlib.PureWindowsPath:
         """
-        Collapse a Windows path by resolving any '..' components and normalizing whichever the
-        platform style.
+        Collapse a Windows path by resolving any '..' components.
 
         :param path: The path to collapse.
 
