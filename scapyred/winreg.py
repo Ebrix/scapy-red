@@ -9,13 +9,13 @@ Windows Registry Client over RPC
 
 import os
 import logging
-import pathlib
 
 from dataclasses import dataclass
 from enum import IntFlag, Enum
 from ctypes.wintypes import PFILETIME
 from typing import NoReturn, Self
 from datetime import datetime, timezone
+from pathlib import PureWindowsPath
 from time import sleep
 
 # Load scapy-rpc
@@ -302,7 +302,7 @@ UPN = "Administrator@192.168.1.2"
         self.current_root_handle = None
         self.current_subkey_handle = None
         self.expl_mode = False
-        self.pwd = pathlib.PureWindowsPath("/")
+        self.pwd = PureWindowsPath("/")
         self.sam_requested_access_rights = 0x2000000  # Maximum Allowed
         if rootKey in AVAILABLE_ROOT_KEYS:
             self.current_root_path = rootKey.strip()
@@ -450,11 +450,28 @@ UPN = "Administrator@192.168.1.2"
         if self._require_root_handles(silent=True):
             return []
 
-        parent = self.pwd / (subkey or "")
+        # Trailing slash means the path itself is the directory
+        if subkey.endswith("/") or subkey.endswith("\\"):
+            parent_dir = PureWindowsPath(subkey)
+            subkey = ""
 
+        if subkey.startswith("/") or subkey.startswith("\\"):
+            parent_dir = PureWindowsPath(subkey)
+            subkey = ""
+        else:
+            parent_dir = PureWindowsPath(subkey).parent
+            subkey = str(PureWindowsPath(subkey).name)
+
+        # # parent = self.collapse_path(self.pwd / (subkey or "")).parent
+        # print(
+        #     f"parent_dir: {parent_dir}, self.pwd: {self.pwd}, subkey: >{subkey}< {type(subkey)}"
+        # )
+        # print([self.ls(parent_dir)])
+        # print(subkey.lower())
+        # print([str(subk).lower() for subk in self.ls(parent_dir)])
         return [
-            self.normalize_path(parent / subk)
-            for subk in self.ls(parent)
+            self.normalize_path(parent_dir / subk)
+            for subk in self.ls(parent_dir)
             if str(subk).lower().startswith(subkey.lower())
         ]
 
@@ -567,7 +584,7 @@ UPN = "Administrator@192.168.1.2"
 
         if not subkey.strip():
             # go to root
-            tmp_path = pathlib.PureWindowsPath()
+            tmp_path = PureWindowsPath()
             tmp_handle = self.get_handle_on_subkey(tmp_path)
         else:
             # Try to use the cache
@@ -1220,7 +1237,7 @@ Info on key:
         else:
             # Otherwise, we use the current subkey path as the output path
             output_path = self.normalize_path(
-                pathlib.PureWindowsPath(output_path) / (str(key_to_save) + ".reg")
+                PureWindowsPath(output_path) / (str(key_to_save) + ".reg")
             )
 
         if fsecurity:
@@ -1320,7 +1337,7 @@ Info on key:
 
     def get_handle_on_subkey(
         self,
-        subkey_path: pathlib.PureWindowsPath,
+        subkey_path: PureWindowsPath,
         desired_access_rights: IntFlag | None = None,
     ) -> NDRContextHandle | None:
         """
@@ -1418,12 +1435,24 @@ Info on key:
 
         return cache_elt if cache_name is not None else handle
 
-    def collapse_path(self, path):
-        # the amount of pathlib.wtf you need to do to resolve .. on all platforms
-        # is ridiculous
-        return pathlib.PureWindowsPath(os.path.normpath(path.as_posix()))
+    def collapse_path(self, path: PureWindowsPath) -> PureWindowsPath:
+        """
+        Collapse a Windows path by resolving any '..' components and normalizing whichever the
+        platform style.
 
-    def normalize_path(self, path):
+        :param path: The path to collapse.
+
+        :example:
+            > self.collapse_path(PureWindowsPath("/../azerar/azer/../"))
+            PureWindowsPath('/azerar')
+
+            > self.collapse_path(PureWindowsPath("\\..\\azerar\\azer\\.."))
+            PureWindowsPath('/azerar')
+        """
+
+        return PureWindowsPath(os.path.normpath(path.as_posix()))
+
+    def normalize_path(self, path: PureWindowsPath) -> str:
         """
         Normalize path for CIFS usage
         """
