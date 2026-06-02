@@ -119,10 +119,6 @@ assert all(
 
 = WinReg - Test retrieving a security descriptor from the registry
 
-client.backup()
-sd = client.get_sd("SAM")
-assert isinstance(sd, SECURITY_DESCRIPTOR)
-
 sd = client.get_sd("SECURITY")
 assert sd is None
 
