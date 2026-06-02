@@ -492,7 +492,10 @@ UPN = "Administrator@192.168.1.2"
             # no need to query again the RPC
             return res.values
 
-        subkey_path = self.normalize_path(self.pwd / subkey)
+        if subkey is not None:
+            subkey_path = self.normalize_path(self.pwd / subkey)
+        else:
+            subkey_path = self.normalize_path(self.pwd)
 
         log_runtime.debug("Enumerating values from the %s subkey", subkey_path)
         try:
@@ -1324,7 +1327,13 @@ Info on key:
         if isinstance(cache_type, str):
             cache_type = [cache_type]
         for t in cache_type:
-            to_remove = [x for x in self.cache[t] if x.upper() == subkey_path.upper()]
+            to_remove = [
+                x
+                for x in self.cache[t]
+                if x.upper() == str(subkey_path).upper()
+                or x.upper().endswith(str(subkey_path).upper())
+                or str(subkey_path).upper().endswith(x.upper())
+            ]
             for x in to_remove:
                 c_elt = self.cache[t].pop(x, None)
                 if c_elt is not None:
