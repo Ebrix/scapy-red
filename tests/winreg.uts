@@ -118,13 +118,16 @@ assert all(
 )
 
 = WinReg - Test retrieving a security descriptor from the registry
+try:
+    sd = client.get_sd("SECURITY")
+    assert False
+except:
+    pass
 
-sd = client.get_sd("SECURITY")
-assert sd is None
-
-client.backup(activate=True)
+client.backup()
 sd = client.get_sd("SECURITY")
 assert isinstance(sd, SECURITY_DESCRIPTOR)
+client.backup()
 
 = WinReg - Test querying information about a registry key.
 
