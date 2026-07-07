@@ -21,6 +21,9 @@ Some commands require authentication:
 
 - `scapy-smbclient`: a wrapper around Scapy's [smbclient](https://scapy.readthedocs.io/en/latest/layers/smb.html#high-level-smbclient).
 - `scapy-ldaphero`: a wrapper around Scapy's [LDAPHero](https://scapy.readthedocs.io/en/latest/layers/ldap.html#ldaphero).
+- `scapy-winreg`: a client to browse remote and local registries.
+
+![](img/winreg.gif)
 
 ## Installation
 

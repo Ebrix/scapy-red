@@ -9,13 +9,12 @@ Windows Registry Client over RPC
 
 import os
 import logging
-import sys
+import pathlib
 
 from dataclasses import dataclass
 from enum import IntFlag, Enum
 from ctypes.wintypes import PFILETIME
 from typing import NoReturn, Self
-from pathlib import PureWindowsPath
 from datetime import datetime, timezone
 from time import sleep
 
@@ -244,28 +243,25 @@ class RegClient(CLIUtil):
             self.client.connect(
                 target,
                 timeout=self.timeout,
-                smb_kwargs={"debug": debug},
+                smb_kwargs={"debug": debug > 1 and debug},
             )
             self.client.bind()
         except ValueError as exc:
-            log_runtime.warning(
-                f"""
+            log_runtime.warning(f"""
                 Remote service didn't seem to be running.
                 Let's try again in 2", now that we should have trigger it. ({exc})
-                """
-            )
+                """)
 
             sleep(2)
             self.client.connect(
                 target,
                 timeout=self.timeout,
-                smb_kwargs={"debug": debug},
+                smb_kwargs={"debug": debug > 1 and debug},
             )
             self.client.bind()
         except Scapy_Exception as exc:
             if str(3221225566) in str(exc):
-                log_runtime.error(
-                    f"""
+                log_runtime.error(f"""
 [!] STATUS_LOGON_FAILURE - {exc}  You used:
     - UPN {UPN},
     - password {password},
@@ -280,8 +276,7 @@ class RegClient(CLIUtil):
 UPN = "WORKGROUP\\\\Administrator" or
 UPN = "Administrator@WORKGROUP" or
 UPN = "Administrator@192.168.1.2"
-"""
-                )
+""")
             raise exc
         except TimeoutError as exc:
             log_runtime.error(
@@ -307,7 +302,7 @@ UPN = "Administrator@192.168.1.2"
         self.current_root_handle = None
         self.current_subkey_handle = None
         self.expl_mode = False
-        self.current_subkey_path: PureWindowsPath = PureWindowsPath("")
+        self.pwd = pathlib.PureWindowsPath("/")
         self.sam_requested_access_rights = 0x2000000  # Maximum Allowed
         if rootKey in AVAILABLE_ROOT_KEYS:
             self.current_root_path = rootKey.strip()
@@ -320,7 +315,7 @@ UPN = "Administrator@192.168.1.2"
             self.loop(debug=debug)
 
     def ps1(self) -> str:
-        return f"[reg] {self.current_root_path}\\{self.current_subkey_path} > "
+        return f"[reg] {self.current_root_path}{self.pwd} > "
 
     @CLIUtil.addcommand()
     def close(self) -> None:
@@ -414,30 +409,24 @@ UPN = "Administrator@192.168.1.2"
         elif len(res.values) != 0:
             # If the resolution was already performed,
             # no need to query again the RPC
-            return res.values
+            values = res.values
+        else:
+            # Enumerate the subkeys
+            subkey_str = self.normalize_path(self.pwd / (subkey or ""))
+            log_runtime.debug("Enumerating subkeys at %s", subkey_str)
 
-        # format subkey as a string to get a subkey path
-        if subkey is None:
-            subkey = ""
+            try:
+                subkeys = self.client.enum_subkeys(res.handle, timeout=self.timeout)
+                self._add_to_cache("ls", subkey_str, subkeys)
+            except ValueError as resp_exc:
+                log_runtime.error(
+                    "Got status %s while enumerating keys", hex(int(resp_exc.args[0]))
+                )
+                self._remove_from_cache("ls", subkey_str)
+                return []
 
-        subkey_path = self._join_path(self.current_subkey_path, subkey)
-
-        # Enumerate the subkeys
-        log_runtime.debug("Enumerating subkeys at %s", subkey_path)
-
-        try:
-            subkeys = self.client.enum_subkeys(res.handle, timeout=self.timeout)
-            self.cache["ls"][subkey_path].values.extend(subkeys)
-        except ValueError as resp_exc:
-            log_runtime.error(
-                "Got status %s while enumerating keys", hex(int(resp_exc.args[0]))
-            )
-            c_elt = self.cache["ls"].pop(subkey_path, None)
-            if c_elt is not None:
-                self._close_key(c_elt.handle)
-            return []
-
-        return self.cache["ls"][subkey_path].values
+            values = self.cache["ls"][subkey_str].values
+        return values
 
     @CLIUtil.addoutput(ls)
     def ls_output(self, results: list[str]) -> None:
@@ -447,25 +436,34 @@ UPN = "Administrator@192.168.1.2"
         for subkey in results:
             print(subkey)
 
+    def _parsepath(self, arg, remote=True):
+        """
+        Parse a path. Returns the parent folder and file name
+        """
+        # Find parent directory if it exists
+        elt = (pathlib.PureWindowsPath if remote else pathlib.Path)(arg)
+        eltpar = (pathlib.PureWindowsPath if remote else pathlib.Path)(".")
+        eltname = elt.name
+        if arg.endswith("/") or arg.endswith("\\"):
+            eltpar = elt
+            eltname = ""
+        elif elt.parent and elt.parent.name or elt.is_absolute():
+            eltpar = elt.parent
+        return eltpar, eltname
+
     @CLIUtil.addcomplete(ls)
-    def ls_complete(self, subkey: str) -> list[str]:
+    def ls_complete(self, arg: str) -> list[str]:
         """
-        Auto-complete ls
+        Return a listing of the remote keys for completion purposes
         """
-        if self._require_root_handles(silent=True):
+        eltpar, eltname = self._parsepath(arg)
+        # ls in that directory
+        try:
+            results = self.ls(subkey=eltpar)
+        except ValueError:
             return []
-
-        subkey = subkey.strip().replace("/", "\\")
-        if "\\" in subkey:
-            parent = "\\".join(subkey.split("\\")[:-1])
-            subkey = subkey.split("\\")[-1]
-        else:
-            parent = ""
-
         return [
-            str(self._join_path(parent, str(subk)))
-            for subk in self.ls(parent)
-            if str(subk).lower().startswith(subkey.lower())
+            str(eltpar / x) for x in results if x.lower().startswith(eltname.lower())
         ]
 
     @CLIUtil.addcommand(mono=True)
@@ -494,19 +492,20 @@ UPN = "Administrator@192.168.1.2"
             # no need to query again the RPC
             return res.values
 
-        subkey_path = self._join_path(self.current_subkey_path, subkey)
+        if subkey is not None:
+            subkey_path = self.normalize_path(self.pwd / subkey)
+        else:
+            subkey_path = self.normalize_path(self.pwd)
 
         log_runtime.debug("Enumerating values from the %s subkey", subkey_path)
         try:
             entries = self.client.enum_values(res.handle, timeout=self.timeout)
-            self.cache["cat"][subkey_path].values.extend(entries)
+            self._add_to_cache("cat", subkey_path, entries)
         except ValueError as resp_exc:
             log_runtime.error(
                 "got status %s while enumerating values", hex(int(resp_exc.args[0]))
             )
-            c_elt = self.cache["cat"].pop(subkey_path, None)
-            if c_elt is not None:
-                self._close_key(c_elt.handle)
+            self._remove_from_cache("cat", subkey_path)
             return []
 
         return self.cache["cat"][subkey_path].values
@@ -575,11 +574,10 @@ UPN = "Administrator@192.168.1.2"
             not be provided here.
         """
 
-        if subkey.strip() == "":
-            # If the subkey is ".", we do not change the current subkey path
-            tmp_path = PureWindowsPath()
+        if not subkey.strip():
+            # go to root
+            tmp_path = pathlib.PureWindowsPath("/")
             tmp_handle = self.get_handle_on_subkey(tmp_path)
-
         else:
             # Try to use the cache
             res = self._get_cached_elt(
@@ -587,20 +585,19 @@ UPN = "Administrator@192.168.1.2"
                 cache_name="cd",
             )
             tmp_handle = res.handle if res else None
-            tmp_path = self._join_path(self.current_subkey_path, subkey)
+            tmp_path = self.collapse_path(self.pwd / subkey)
 
         if tmp_handle is not None:
             # If the handle was successfully retrieved,
             # we update the current subkey path and handle
-            self.current_subkey_path = tmp_path
+            self.pwd = tmp_path
             self.current_subkey_handle = tmp_handle
         else:
-            log_runtime.error("Could not change directory to %s", subkey)
             raise ValueError(f"Could not change directory to {subkey}")
 
         if self.expl_mode:
             # force the trigger of the UTILS.OUTPUT command (cd_output)
-            return f"[{self.current_root_path}:\\{self.current_subkey_path}]"
+            return f"[{self.current_root_path}:\\{self.pwd}]"
 
     @CLIUtil.addcomplete(cd)
     def cd_complete(self, subkey: str) -> list[str]:
@@ -660,17 +657,10 @@ UPN = "Administrator@192.168.1.2"
 
         # Log and prepare request
         log_runtime.debug("Getting security descriptor for %s", subkey)
-
-        try:
-            sd = self.client.get_key_security(
-                handle,
-                timeout=self.timeout,
-            )
-        except ValueError as resp_exc:
-            log_runtime.error(
-                "Got status %s while getting security", hex(resp_exc.args[0])
-            )
-            return None
+        sd = self.client.get_key_security(
+            handle,
+            timeout=self.timeout,
+        )
 
         return sd
 
@@ -716,13 +706,7 @@ UPN = "Administrator@192.168.1.2"
 
         # Log and request info
         log_runtime.debug("Querying info for %s", subkey)
-        try:
-            resp = self.client.get_key_info(handle, timeout=self.timeout)
-        except ValueError as resp_exc:
-            log_runtime.error(
-                "Got status %s while querying info", hex(int(resp_exc.args[0]))
-            )
-            return None
+        resp = self.client.get_key_info(handle, timeout=self.timeout)
 
         return resp
 
@@ -736,8 +720,7 @@ UPN = "Administrator@192.168.1.2"
             print("No information found.")
             return
         class_info = info.valueof("lpClassOut.Buffer")
-        print(
-            f"""
+        print(f"""
 Info on key:
   - Number of subkeys: {info.lpcSubKeys}
   - Length of the longest subkey name (in bytes): {info.lpcbMaxSubKeyLen}
@@ -747,8 +730,7 @@ Info on key:
   - Class: {bytes.fromhex(class_info[:-1].decode())
             if class_info is not None
             else "None"}
-"""
-        )
+""")
 
     @CLIUtil.addcomplete(query_info)
     def query_info_complete(self, subkey: str) -> list[str]:
@@ -830,9 +812,9 @@ Info on key:
             return None
 
         if subkey is None:
-            subkey_path = self.current_subkey_path
+            subkey_path = self.pwd
         else:
-            subkey_path = self._join_path(self.current_subkey_path, subkey)
+            subkey_path = self.normalize_path(self.pwd / subkey)
 
         # look for default value
         if value_name == "(Default)" and not is_not_default:
@@ -884,19 +866,12 @@ Info on key:
             )
             # We remove the entry from the cache if it exists
             # Even if the response status is not OK, we want to remove it
-            if subkey_path in self.cache["cat"]:
-                c_elt = self.cache["cat"].pop(subkey_path, None)
-                if c_elt is not None:
-                    self._close_key(c_elt.handle)
-            return None
+            self._remove_from_cache("cat", subkey_path)
+            raise resp_exc
 
         # We remove the entry from the cache if it exists
         # Even if the response status is not OK, we want to remove it
-        if subkey_path in self.cache["cat"]:
-            c_elt = self.cache["cat"].pop(subkey_path, None)
-            if c_elt is not None:
-                self._close_key(c_elt.handle)
-
+        self._remove_from_cache("cat", subkey_path)
         return True
 
     @CLIUtil.addcomplete(set_value)
@@ -992,14 +967,12 @@ Info on key:
             log_runtime.error("Could not get handle on the specified subkey.")
             return None
 
-        if subkey is None:
-            subkey_path = self._join_path(self.current_subkey_path, new_key)
-        else:
-            subkey_path = self._join_path(self.current_subkey_path, subkey)
-            subkey_path = self._join_path(subkey_path, new_key)
+        parent = self.collapse_path(self.pwd / (subkey or ""))
+        parent_path = self.normalize_path(parent)
+        subkey_path = self.normalize_path(parent / new_key)
 
         # Log and send request
-        log_runtime.debug("Creating key %s under %s", new_key, subkey_path)
+        log_runtime.debug("Creating key %s under %s", new_key, parent)
 
         try:
             self.client.create_subkey(
@@ -1016,25 +989,13 @@ Info on key:
             )
             # We remove the entry from the cache if it exists
             # Even if the response status is not OK, we want to remove it
-            if subkey_path.parent in self.cache["ls"]:
-                c_elt = self.cache["ls"].pop(subkey_path.parent, None)
-                if c_elt is not None:
-                    self._close_key(c_elt.handle)
-            if subkey_path in self.cache["cat"]:
-                c_elt = self.cache["cat"].pop(subkey_path, None)
-                if c_elt is not None:
-                    self._close_key(c_elt.handle)
-            return None
+            self._remove_from_cache("ls", parent_path)
+            self._remove_from_cache("cat", subkey_path)
+            raise resp_exc
 
         # We remove the entry from the cache if it exists
-        if subkey_path.parent in self.cache["ls"]:
-            c_elt = self.cache["ls"].pop(subkey_path.parent, None)
-            if c_elt is not None:
-                self._close_key(c_elt.handle)
-        if subkey_path in self.cache["cat"]:
-            c_elt = self.cache["cat"].pop(subkey_path, None)
-            if c_elt is not None:
-                self._close_key(c_elt.handle)
+        self._remove_from_cache("ls", parent_path)
+        self._remove_from_cache("cat", subkey_path)
 
         print(f"Key {new_key} created successfully.")
         return True
@@ -1057,10 +1018,9 @@ Info on key:
         self.backup(activate=True)
 
         # Determine the subkey path for logging and cache purposes
-        if subkey is None:
-            subkey_path = self.current_subkey_path
-        else:
-            subkey_path = self._join_path(self.current_subkey_path, subkey)
+        subkey = self.collapse_path(self.pwd / (subkey or ""))
+        parent_path = self.normalize_path(subkey.parent)
+        subkey_path = self.normalize_path(subkey)
 
         # Log and prepare request
         log_runtime.debug("Deleting key %s", subkey_path)
@@ -1076,26 +1036,14 @@ Info on key:
             )
             # Even if the response status is not OK, we want to remove it
             # the entry from the cache if it exists
-            if subkey_path.parent in self.cache["ls"]:
-                c_elt = self.cache["ls"].pop(subkey_path.parent, None)
-                if c_elt is not None:
-                    self._close_key(c_elt.handle)
-            if subkey_path in self.cache["cat"]:
-                c_elt = self.cache["cat"].pop(subkey_path, None)
-                if c_elt is not None:
-                    self._close_key(c_elt.handle)
-            return None
+            self._remove_from_cache("ls", parent_path)
+            self._remove_from_cache("cat", subkey_path)
+            raise resp_exc
 
         # We remove the entry from the cache if it exists
         # Even if the response status is not OK, we want to remove it
-        if subkey_path.parent in self.cache["ls"]:
-            c_elt = self.cache["ls"].pop(subkey_path.parent, None)
-            if c_elt is not None:
-                self._close_key(c_elt.handle)
-        if subkey_path in self.cache["cat"]:
-            c_elt = self.cache["cat"].pop(subkey_path, None)
-            if c_elt is not None:
-                self._close_key(c_elt.handle)
+        self._remove_from_cache("ls", parent_path)
+        self._remove_from_cache("cat", subkey_path)
 
         print(f"Key {subkey} deleted successfully.")
         return True
@@ -1132,10 +1080,7 @@ Info on key:
             return None
 
         # Determine the subkey path for logging and cache purposes
-        if subkey is None:
-            subkey_path = self.current_subkey_path
-        else:
-            subkey_path = self._join_path(self.current_subkey_path, subkey)
+        subkey_path = self.normalize_path(self.pwd / (subkey or ""))
 
         # Log and prepare request
         log_runtime.debug("Deleting value %s in %s", value, subkey_path)
@@ -1152,18 +1097,11 @@ Info on key:
             )
             # Even if the response status is not OK, we want to remove it
             # the entry from the cache if it exists
-            if subkey_path in self.cache["cat"]:
-                c_elt = self.cache["cat"].pop(subkey_path, None)
-                if c_elt is not None:
-                    self._close_key(c_elt.handle)
-            return None
+            self._remove_from_cache("cat", subkey_path)
+            raise resp_exc
 
         # We remove the entry from the cache if it exists
-        if subkey_path in self.cache["cat"]:
-            c_elt = self.cache["cat"].pop(subkey_path, None)
-            if c_elt is not None:
-                self._close_key(c_elt.handle)
-
+        self._remove_from_cache("cat", subkey_path)
         print(f"Value {value} deleted successfully.")
         return True
 
@@ -1208,9 +1146,9 @@ Info on key:
         By default it saves the backup to a file protected so that only BA can read it.
 
         :param output_path: The path to save the backup file. If None, it defaults
-                            to the current subkey name with .reg extension.
-                            If the output path ends with .reg, it uses it as is,
-                            otherwise it appends .reg to the output path.
+            to the current subkey name with .reg extension. If the output path ends
+            with .reg, it will consider it's a file, otherwise it is considered as
+            a folder path.
         :param subkey: the relative subkey to backup. If None, it uses the
                             current subkey path.
         :param fsecurity: do not set security descriptor of the backup. Let it be
@@ -1224,9 +1162,7 @@ Info on key:
 
         # Try to use the cache
         handle = self._get_cached_elt(subkey=subkey)
-        key_to_save = (
-            subkey.split("\\")[-1] if subkey else self.current_subkey_path.name
-        )
+        key_to_save = subkey.split("\\")[-1] if subkey else self.pwd.name
 
         if handle is None:
             log_runtime.error("Could not get handle on the specified subkey.")
@@ -1235,14 +1171,14 @@ Info on key:
         # Default path is %WINDIR%\System32
         if output_path is None:
             output_path = str(key_to_save) + ".reg"
-
         elif output_path.endswith(".reg"):
             # If the output path ends with .reg, we use it as is
-            output_path = str(self._join_path("", output_path))
-
+            output_path = self.normalize_path(output_path)
         else:
             # Otherwise, we use the current subkey path as the output path
-            output_path = str(self._join_path(output_path, str(key_to_save) + ".reg"))
+            output_path = self.normalize_path(
+                pathlib.PureWindowsPath(output_path) / (str(key_to_save) + ".reg")
+            )
 
         if fsecurity:
             print(
@@ -1271,10 +1207,10 @@ Info on key:
 
         log_runtime.info(
             "Backup of %s saved to %s.reg successful ",
-            self.current_subkey_path,
+            self.pwd,
             output_path,
         )
-        print(f"Backup of {self.current_subkey_path} saved to {output_path}")
+        print(f"Backup of {self.pwd} saved to {output_path}")
         return True
 
     # --------------------------------------------- #
@@ -1341,7 +1277,7 @@ Info on key:
 
     def get_handle_on_subkey(
         self,
-        subkey_path: PureWindowsPath,
+        subkey_path: pathlib.PureWindowsPath,
         desired_access_rights: IntFlag | None = None,
     ) -> NDRContextHandle | None:
         """
@@ -1369,7 +1305,7 @@ Info on key:
         try:
             resp_handle = self.client.get_subkey_handle(
                 self.current_root_handle,
-                subkey_path,
+                self.normalize_path(subkey_path),
                 desired_access_rights=desired_access_rights,
                 options=self.extra_options,
                 timeout=self.timeout,
@@ -1380,9 +1316,28 @@ Info on key:
                 hex(int(resp_exc.args[0])),
                 subkey_path,
             )
-            return None
+            raise resp_exc
 
         return resp_handle
+
+    def _add_to_cache(self, cache_type: str, subkey_path: str, values):
+        self.cache[cache_type][subkey_path].values.extend(values)
+
+    def _remove_from_cache(self, cache_type: str | list, subkey_path: str):
+        if isinstance(cache_type, str):
+            cache_type = [cache_type]
+        for t in cache_type:
+            to_remove = [
+                x
+                for x in self.cache[t]
+                if x.upper() == str(subkey_path).upper()
+                or x.upper().endswith(str(subkey_path).upper())
+                or str(subkey_path).upper().endswith(x.upper())
+            ]
+            for x in to_remove:
+                c_elt = self.cache[t].pop(x, None)
+                if c_elt is not None:
+                    self._close_key(c_elt.handle)
 
     def _get_cached_elt(
         self,
@@ -1414,70 +1369,53 @@ Info on key:
             # Default to read access rights
             desired_access = 0x20019  # KEY_READ | STANDARD_RIGHTS_READ
 
-        # If no specific subkey was specified
-        # we use our current subkey path
-        if subkey is None or subkey == "" or subkey == ".":
-            subkey_path = self.current_subkey_path
-
-        # Otherwise we use the subkey path,
-        # the calling parent shall make sure that this path was properly sanitized
-        else:
-            subkey_path = self._join_path(self.current_subkey_path, subkey)
+        subkey_path = self.collapse_path(self.pwd / (subkey or ""))
+        subkey_str = self.normalize_path(subkey_path)
 
         # If cache name is specified, we try to use it
         if (
             self.cache.get(cache_name, None) is not None
-            and self.cache[cache_name].get(subkey_path, None) is not None
-            and self.cache[cache_name][subkey_path].access == desired_access
+            and self.cache[cache_name].get(subkey_str, None) is not None
+            and self.cache[cache_name][subkey_str].access == desired_access
         ):
             # If we have a cache, we check if the handle is already cached
             # If the access rights are the same, we return the cached elt
-            return self.cache[cache_name][subkey_path]
+            return self.cache[cache_name][subkey_str]
 
         # Otherwise, we need to get a new handle on the subkey
         handle = self.get_handle_on_subkey(subkey_path, desired_access)
         if handle is None:
-            log_runtime.error("Could not get handle on %s", subkey_path)
+            log_runtime.error("Could not get handle on %s", subkey_str)
             return None
 
         # If we have a cache name, we store the handle in the cache
         cache_elt = CacheElt(handle, desired_access, [])
         if cache_name is not None:
-            self.cache[cache_name][subkey_path] = cache_elt
+            self.cache[cache_name][subkey_str] = cache_elt
 
         return cache_elt if cache_name is not None else handle
 
-    def _join_path(
-        self, first_path: str | None, second_path: str | None
-    ) -> PureWindowsPath:
+    def collapse_path(self, path: pathlib.PureWindowsPath) -> pathlib.PureWindowsPath:
         """
-        Join two paths in a way that is compatible with Windows paths.
-        This ensures that the paths are normalized and combined correctly,
-        even if they are provided as strings or PureWindowsPath objects.
+        Collapse a Windows path by resolving any '..' components.
 
-        :param first_path: The first path to join.
-        :param second_path: The second path to join.
+        :param path: The path to collapse.
 
-        :return: A PureWindowsPath object representing the combined path.
+        :example:
+            > self.collapse_path(PureWindowsPath("/../azerar/azer/../"))
+            PureWindowsPath('/azerar')
+
+            > self.collapse_path(PureWindowsPath("\\..\\azerar\\azer\\.."))
+            PureWindowsPath('/azerar')
         """
 
-        if first_path is None:
-            first_path = ""
-        if second_path is None:
-            second_path = ""
-        if str(PureWindowsPath(second_path).as_posix()).startswith("/"):
-            # If the second path is an absolute path, we return it as is
-            return PureWindowsPath(
-                os.path.normpath(PureWindowsPath(second_path).as_posix()).lstrip("/")
-            )
-        return PureWindowsPath(
-            os.path.normpath(
-                os.path.join(
-                    PureWindowsPath(first_path).as_posix(),
-                    PureWindowsPath(second_path).as_posix(),
-                )
-            )
-        )
+        return pathlib.PureWindowsPath(os.path.normpath(path.as_posix()))
+
+    def normalize_path(self, path: pathlib.PureWindowsPath) -> str:
+        """
+        Normalize path for CIFS usage
+        """
+        return str(self.collapse_path(path)).lstrip("\\")
 
     def _require_root_handles(self, silent: bool = False) -> bool:
         """
@@ -1498,14 +1436,7 @@ Info on key:
 
         # Log and close
         log_runtime.debug("Closing hKey %s - %s", handle.uuid, handle.uuid.hex())
-        try:
-            self.client.close_key(handle, timeout=self.timeout)
-        except ValueError as resp_exc:
-            log_runtime.error(
-                "Got status %s while closing key", hex(int(resp_exc.args[0]))
-            )
-            return None
-
+        self.client.close_key(handle, timeout=self.timeout)
         return True
 
     @CLIUtil.addcommand()
@@ -1526,11 +1457,9 @@ Info on key:
         """
 
         log_runtime.info("Jumping into the code for dev purpose...")
-        print(
-            """[!] For a better experience type:
+        print("""[!] For a better experience type:
 from IPython import embed
-embed()"""
-        )
+embed()""")
         breakpoint()
 
 

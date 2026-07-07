@@ -7,6 +7,7 @@
 List the IP addresses of a remote machine using DCE/RPC
 """
 
+import os
 import time
 
 from multiprocessing.dummy import Pool
@@ -48,7 +49,7 @@ def listips(
 
     def resolv(ip):
         if not csv:
-            print(f"Scanning {ip}...")
+            os.write(1, b".")
         try:
             bindings, _ = ServerAlive2(ip, timeout=timeout)
         except (OSError, ValueError):
@@ -76,6 +77,7 @@ def listips(
         for res in results:
             print(",".join(res))
     else:
+        print()
         print(
             pretty_list(
                 results,

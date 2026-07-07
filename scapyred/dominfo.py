@@ -28,6 +28,8 @@ from scapy.layers.ldap import (
 from scapy.asn1.asn1 import ASN1_STRING
 from scapy.layers.msrpce.mspac import WINNT_SID
 
+from typing import Optional
+
 FUNCTIONAL = {
     0: "DS_BEHAVIOR_WIN2000",
     1: "DS_BEHAVIOR_WIN2003_WITH_MIXED_DOMAINS",
@@ -41,12 +43,25 @@ FUNCTIONAL = {
 }
 
 
-def dominfo(realm: str, timeout: int = 3):
+def dominfo(realm: str = None, ip: str = None, timeout: int = 3):
     """
     Get interesting domain information as unauthenticated
+
+    :param realm: the DNS domain realm to query. e.g. "domain.local"
+    :param ip: if provided, the IP of one specific domain controller
+
+    Example::
+
+        # Avec DC locator
+        scapy-dominfo --realm domain.local
+
+        # Sans DC locator
+        scapy-dominfo --ip 192.168.0.100
     """
     # IP
-    ip = dclocator(realm).ip
+    if ip is None:
+        ip = dclocator(realm, debug=1).ip
+
     # Open LDAP connection (TCP)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(timeout)
@@ -57,13 +72,19 @@ def dominfo(realm: str, timeout: int = 3):
             protocolOp=LDAP_SearchRequest(
                 filter=LDAP_Filter(
                     filter=LDAP_FilterAnd(
-                        vals=[
-                            LDAP_Filter(
-                                filter=LDAP_FilterEqual(
-                                    attributeType=ASN1_STRING(b"DnsDomain"),
-                                    attributeValue=ASN1_STRING(realm),
-                                )
-                            ),
+                        vals=(
+                            [
+                                LDAP_Filter(
+                                    filter=LDAP_FilterEqual(
+                                        attributeType=ASN1_STRING(b"DnsDomain"),
+                                        attributeValue=ASN1_STRING(realm),
+                                    )
+                                ),
+                            ]
+                            if realm
+                            else []
+                        )
+                        + [
                             LDAP_Filter(
                                 filter=LDAP_FilterEqual(
                                     attributeType=ASN1_STRING(b"NtVer"),
@@ -79,7 +100,7 @@ def dominfo(realm: str, timeout: int = 3):
                         # Below is the entire list. Although most of them are not
                         # interesting or are not implemented
                         b"Netlogon",  # KEEP
-                        # b"configurationNamingContext ",
+                        b"configurationNamingContext ",
                         b"currentTime",  # KEEP
                         # b"defaultNamingContext",
                         # b"dNSHostName",
@@ -91,17 +112,17 @@ def dominfo(realm: str, timeout: int = 3):
                         b"isGlobalCatalogReady",  # KEEP
                         # b"isSynchronized",
                         b"ldapServiceName",  # KEEP
-                        # b"namingContexts",
+                        b"namingContexts",  # KEEP
                         b"netlogon",  # KEEP
                         # b"pendingPropagations",
                         b"rootDomainNamingContext",  # KEEP
-                        # b"schemaNamingContext",
+                        b"schemaNamingContext",
                         b"serverName",  # KEEP
                         # b"subschemaSubentry",
                         # b"supportedCapabilities",
                         # b"supportedControl",
                         # b"supportedLDAPPolicies",
-                        # b"supportedLDAPVersion",
+                        b"supportedLDAPVersion",
                         b"supportedSASLMechanisms",  # KEEP
                         b"domainControllerFunctionality",  # KEEP
                         b"domainFunctionality",  # KEEP
@@ -115,12 +136,12 @@ def dominfo(realm: str, timeout: int = 3):
                         # b"msDS-TopQuotaUsage",
                         # b"supportedConfigurableSettings",
                         # b"supportedExtension",
-                        # b"validFSMOs",
-                        # b"dsaVersio",
+                        b"validFSMOs",
+                        b"dsaVersion",
                         b"msDS-PortLDAP",  # KEEP
                         b"msDS-PortSSL",  # KEEP
-                        b"msDS-PrincipalName",
-                        b"serviceAccountInfo",
+                        # b"msDS-PrincipalName",
+                        # b"serviceAccountInfo",
                         # b"spnRegistrationResult",
                         # b"tokenGroups",
                         # b"usnAtRifmYLargeInteger",
@@ -151,46 +172,51 @@ def dominfo(realm: str, timeout: int = 3):
         timeout=timeout,
         verbose=0,
     )
-    if pkt:
-        # We have a result
-        results = []
-        for x in pkt[LDAP].protocolOp.attributes:
-            typ = x.type.val.decode()
-            # Parse the result depending on the type
-            if typ.lower() == "netlogon":
-                netlogon = NETLOGON_SAM_LOGON_RESPONSE_EX(x.values[0].value.val)
-                for fld in [
-                    "DnsForestName",
-                    "DnsDomainName",
-                    "DnsHostName",
-                    "NetbiosDomainName",
-                    "NetbiosComputerName",
-                    "UserName",
-                    "DcSiteName",
-                    "DcSiteName",
-                    "ClientSiteName",
-                ]:
-                    results.append((fld, netlogon.getfieldval(fld).decode()))
-                results.append(("DomainGuid", netlogon.sprintf("%DomainGuid%")))
-                continue
-            elif typ.lower().endswith("functionality"):
-                i = int(x.values[0].value.val)
-                results.append((typ, FUNCTIONAL.get(i, str(i))))
-            elif typ.lower() == "rootdomainnamingcontext":
-                rootDomainNamingContext = x.values[0].value.val
-                if m := re.search(b"<SID=([^>]+)>", rootDomainNamingContext):
-                    results.append(
-                        (
-                            "DOMAIN SID",
-                            conf.color_theme.yellow(
-                                WINNT_SID(hex_bytes(m.group(1))).summary()
-                            ),
+    try:
+        if pkt:
+            # We have a result
+            results = []
+            for x in pkt[LDAP].protocolOp.attributes:
+                typ = x.type.val.decode()
+                # Parse the result depending on the type
+                if typ.lower() == "netlogon":
+                    netlogon = NETLOGON_SAM_LOGON_RESPONSE_EX(x.values[0].value.val)
+                    for fld in [
+                        "DnsForestName",
+                        "DnsDomainName",
+                        "DnsHostName",
+                        "NetbiosDomainName",
+                        "NetbiosComputerName",
+                        "UserName",
+                        "DcSiteName",
+                        "DcSiteName",
+                        "ClientSiteName",
+                    ]:
+                        results.append((fld, netlogon.getfieldval(fld).decode()))
+                    results.append(("DomainGuid", netlogon.sprintf("%DomainGuid%")))
+                    continue
+                elif typ.lower().endswith("functionality"):
+                    i = int(x.values[0].value.val)
+                    results.append((typ, FUNCTIONAL.get(i, str(i))))
+                elif typ.lower() == "rootdomainnamingcontext":
+                    rootDomainNamingContext = x.values[0].value.val
+                    if m := re.search(b"<SID=([^>]+)>", rootDomainNamingContext):
+                        results.append(
+                            (
+                                "DOMAIN SID",
+                                conf.color_theme.yellow(
+                                    WINNT_SID(hex_bytes(m.group(1))).summary()
+                                ),
+                            )
                         )
-                    )
-            else:
-                results.append((typ, [y.value.val.decode() for y in x.values]))
-        print(pretty_list(results, [("Attribute", "Value")]))
-    sock.close()
+                else:
+                    results.append((typ, [y.value.val.decode() for y in x.values]))
+            print("Domain Controller: %s\n" % conf.color_theme.green(ip))
+            print(pretty_list(results, [("Attribute", "Value")]))
+        else:
+            print(conf.color_theme.fail("Failure !"))
+    finally:
+        sock.close()
 
 
 def main():

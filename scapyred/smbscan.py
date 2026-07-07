@@ -8,8 +8,9 @@ Scan's SMB servers and return the version of Windows, SMB signing information
 and other information.
 """
 
-import time
+import os
 import socket
+import time
 
 from scapy.automaton import ATMT
 from scapy.base_classes import Net
@@ -104,7 +105,7 @@ def smb_scan_winver(
 
     def resolv(ip):
         if not csv:
-            print(f"Scanning {ip}...")
+            os.write(1, b".")
         sock = socket.socket()
         sock.settimeout(timeout)
         try:
@@ -181,6 +182,7 @@ def smb_scan_winver(
         for res in results:
             print(",".join(res))
     else:
+        print()
         print(pretty_list(results, [headers], borders=True))
 
 

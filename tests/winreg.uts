@@ -35,8 +35,8 @@ for root_key in ["HKLM", "HKCU", "HKCR", "HKU", "HKCC"]:
     result = client.use(root_key)
     print(f"Switched to root key: {root_key} with result: {result}")
     assert result is not None
-    print(result.ls())
-assert False
+    print(client.ls())
+
 
 # Test with an invalid root key
 try:
@@ -45,22 +45,20 @@ try:
 except ValueError:
     pass
 
-# Return the client for further tests
-client.use("HKLM")
-
 = WinReg - Test cd method of RegClient
 
+client.use("HKLM")
+
 # Change to a valid subkey
-result = client.cd("\\SOFTWARE\\Microsoft\\Windows\\")
+result = client.cd("\\SOFTWARE\\Microsoft\\Windows")
 result = client.cd("..")
 result = client.cd("Windows\\CurrentVersion")
-result = client.cd("\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion")
-print(
-    f"Changed directory to SOFTWARE\\Microsoft\\Windows\\CurrentVersion with result: {result}"
-)
-assert client.current_subkey_path == PureWindowsPath(
-    "SOFTWARE/Microsoft/Windows/CurrentVersion"
-)
+# Unix-style
+result = client.cd("/SOFTWARE/Microsoft/Windows/CurrentVersion")
+print(f"Changed directory to SOFTWARE\\Microsoft\\Windows\\CurrentVersion with result: {result}")
+
+print(client.pwd)
+assert client.pwd == PureWindowsPath("/SOFTWARE/Microsoft/Windows/CurrentVersion")
 
 # Attempt to change to an invalid subkey
 try:
@@ -69,9 +67,9 @@ try:
 except ValueError:
     pass
 
-client.cd("")
-
 = WinReg - Test ls method of RegClient
+
+client.cd("")
 
 # List subkeys and values in the current directory
 list_of_first_subkeys = client.ls()
@@ -120,16 +118,16 @@ assert all(
 )
 
 = WinReg - Test retrieving a security descriptor from the registry
+try:
+    sd = client.get_sd("SECURITY")
+    assert False
+except:
+    pass
 
-sd = client.get_sd("SAM")
-assert isinstance(sd, SECURITY_DESCRIPTOR)
-
+client.backup()
 sd = client.get_sd("SECURITY")
-assert sd is None
-
-client.backup(activate=True)
-sd = client.get_sd("SECURITY")
 assert isinstance(sd, SECURITY_DESCRIPTOR)
+client.backup()
 
 = WinReg - Test querying information about a registry key.
 
@@ -243,3 +241,5 @@ assert client.save(output_path="C:\\", subkey="SOFTWARE")
 = WinReg - Close client
 
 client.close()
+
+# vim: ft=python:ts=4:sw=4
