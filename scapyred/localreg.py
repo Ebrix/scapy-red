@@ -43,9 +43,44 @@ from scapy.error import log_runtime
 from scapy.themes import DefaultTheme, NoTheme
 from scapy.utils import CLIUtil
 from scapy.layers.windows.registry import RegEntry, RegType
-from scapy.layers.windows.security import SECURITY_DESCRIPTOR
+from scapy.layers.windows.security import (
+    SECURITY_DESCRIPTOR,
+    WELL_KNOWN_SIDS,
+    _WINNT_ACCESS_MASK,
+)
 
 from scapyred.regf import RegistryHive
+
+
+# Registry-key object-specific access rights (winnt.h). The low 16 bits of an
+# access mask are object-type dependent; since this is a registry browser we
+# decode them as KEY_* rights. (For a service SD they would be SERVICE_*, etc.)
+_REG_ACCESS_RIGHTS = {
+    0x0001: "KEY_QUERY_VALUE",
+    0x0002: "KEY_SET_VALUE",
+    0x0004: "KEY_CREATE_SUB_KEY",
+    0x0008: "KEY_ENUMERATE_SUB_KEYS",
+    0x0010: "KEY_NOTIFY",
+    0x0020: "KEY_CREATE_LINK",
+    0x0100: "KEY_WOW64_64KEY",
+    0x0200: "KEY_WOW64_32KEY",
+}
+
+# ACE type id -> color-theme method name, so allow/deny/audit stand out.
+_ACE_TYPE_COLORS = {
+    0x00: "green",
+    0x05: "green",
+    0x09: "green",
+    0x0B: "green",  # *ALLOWED*
+    0x01: "red",
+    0x06: "red",
+    0x0A: "red",
+    0x0C: "red",  # *DENIED*
+    0x02: "yellow",
+    0x07: "yellow",
+    0x0D: "yellow",
+    0x0F: "yellow",  # *AUDIT*
+}
 
 
 def _filetime_to_str(filetime: int) -> str:
@@ -87,6 +122,75 @@ def _as_security_descriptor(data: bytes) -> SECURITY_DESCRIPTOR | None:
         return SECURITY_DESCRIPTOR(data)
     except Exception:
         return None
+
+
+def _format_access_mask(mask: int, object_rights: dict = None) -> str:
+    """
+    Render an access mask as ``0x000f003f (DELETE+READ_CONTROL+...)``.
+
+    The standard / generic rights (upper bits) are always named. The
+    object-specific low bits are named only when ``object_rights`` is given
+    (e.g. :data:`_REG_ACCESS_RIGHTS` for a registry key); otherwise they are
+    left in the raw hex residual, since their meaning depends on the object
+    type. Any unnamed bits are appended as ``0x...``.
+    """
+    mask = int(mask)
+    name_map = dict(_WINNT_ACCESS_MASK)
+    if object_rights:
+        name_map.update(object_rights)
+    names = []
+    remaining = mask
+    for bit in sorted(name_map):  # ascending, so output is stable
+        if mask & bit:
+            names.append(name_map[bit])
+            remaining &= ~bit
+    if remaining:
+        names.append(f"0x{remaining:x}")
+    return f"0x{mask:08x} ({'+'.join(names) if names else '0'})"
+
+
+def _sid_str(sid) -> str:
+    """Return ``S-1-5-...`` for a SID, with its well-known name when known."""
+    if sid is None:
+        return "(none)"
+    text = sid.summary()
+    friendly = WELL_KNOWN_SIDS.get(text)
+    return f"{text} ({friendly})" if friendly else text
+
+
+def _security_descriptor_lines(
+    sd: SECURITY_DESCRIPTOR, object_rights: dict = None
+) -> list[str]:
+    """
+    Render a security descriptor as a compact, colorized list of lines:
+    Control flags, Owner/Group SIDs, then each DACL/SACL ACE with its type,
+    trustee SID and access mask (hex value + decoded rights).
+
+    :param object_rights: object-specific access-right names for the low mask
+        bits (see :func:`_format_access_mask`).
+    """
+    ct = conf.color_theme
+    lines = [
+        f"{ct.cyan('Control')}: {sd.Control}",
+        f"{ct.cyan('Owner')}  : {_sid_str(getattr(sd, 'OwnerSid', None))}",
+        f"{ct.cyan('Group')}  : {_sid_str(getattr(sd, 'GroupSid', None))}",
+    ]
+    for label in ("DACL", "SACL"):
+        acl = getattr(sd, label, None)
+        if not acl:
+            continue
+        lines.append(f"{ct.cyan(label)} ({len(acl.Aces)} ACE(s)):")
+        for ace in acl.Aces:
+            colorize = getattr(ct, _ACE_TYPE_COLORS.get(ace.AceType, "normal"))
+            ace_flags = str(ace.AceFlags) or "(none)"
+            mask = _format_access_mask(getattr(ace.payload, "Mask", 0), object_rights)
+            lines.append(
+                f"  - {colorize(ace.sprintf('%AceType%'))} "
+                f"{_sid_str(getattr(ace.payload, 'Sid', None))}"
+            )
+            lines.append(f"      {ct.cyan('Mask')} : {mask}")
+            lines.append(f"      {ct.cyan('Flags')}: {ace_flags}")
+    return lines
 
 
 @conf.commands.register
@@ -257,8 +361,8 @@ class RegHiveClient(CLIUtil):
                 sd = _as_security_descriptor(entry.reg_data)
                 if sd is not None:
                     print(f"      {ct.yellow('|_ inferred security descriptor:')}")
-                    for line in sd.show(dump=True).rstrip().splitlines():
-                        print("      " + line)
+                    for line in _security_descriptor_lines(sd):
+                        print("        " + line)
 
     @CLIUtil.addcomplete(cat)
     def cat_complete(self, subkey: str) -> list[str]:
@@ -398,8 +502,9 @@ class RegHiveClient(CLIUtil):
         if sd is None:
             print("No security descriptor found.")
         else:
-            # show_print() honors conf.color_theme, set from our ``color`` flag.
-            sd.show_print()
+            # get_sd always targets a registry key -> decode KEY_* rights.
+            for line in _security_descriptor_lines(sd, _REG_ACCESS_RIGHTS):
+                print(line)
 
     @CLIUtil.addcomplete(get_sd)
     def get_sd_complete(self, subkey: str) -> list[str]:
