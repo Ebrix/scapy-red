@@ -150,15 +150,17 @@ _UAC_FLAGS = [
 ]
 
 # UAC flags worth flagging in yellow when reviewing privileges.
-_UAC_FLAGS_HOT = frozenset({
-    "PASSWD_NOT_REQUIRED",
-    "DONT_EXPIRE_PASSWORD",
-    "PASSWORD_EXPIRED",
-    "DONT_REQUIRE_PREAUTH",
-    "TRUSTED_FOR_DELEGATION",
-    "TRUSTED_TO_AUTHENTICATE_FOR_DELEGATION",
-    "USE_DES_KEY_ONLY",
-})
+_UAC_FLAGS_HOT = frozenset(
+    {
+        "PASSWD_NOT_REQUIRED",
+        "DONT_EXPIRE_PASSWORD",
+        "PASSWORD_EXPIRED",
+        "DONT_REQUIRE_PREAUTH",
+        "TRUSTED_FOR_DELEGATION",
+        "TRUSTED_TO_AUTHENTICATE_FOR_DELEGATION",
+        "USE_DES_KEY_ONLY",
+    }
+)
 
 # DOMAIN_PASSWORD_INFORMATION.PasswordProperties — see [MS-SAMR] §2.2.1.1.
 _PWD_PROPERTIES = [
@@ -182,6 +184,7 @@ _SERVER_ROLES = {
 # --------------------------------------------------------------------------- #
 # Crypto helpers
 # --------------------------------------------------------------------------- #
+
 
 def _des_set_odd_parity(seven: bytes) -> bytes:
     """
@@ -253,6 +256,7 @@ def _aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
 # --------------------------------------------------------------------------- #
 # Time / flag formatting
 # --------------------------------------------------------------------------- #
+
 
 def _filetime_to_iso(ft: int) -> str:
     """
@@ -357,6 +361,7 @@ def _decode_uac_colored(value: int) -> str:
 #       BYTE  Data[DataLen];     // first 16 plaintext bytes = hashed BK
 #   }
 
+
 def derive_hashed_bootkey(f_value: bytes, boot_key: bytes) -> bytes:
     """
     Decrypt the 16-byte "hashed BootKey" embedded in the F value of
@@ -371,7 +376,7 @@ def derive_hashed_bootkey(f_value: bytes, boot_key: bytes) -> bytes:
     if revision in (0x02, 0x03):
         data_len = _u32(key0, 0x0C)
         salt = key0[0x10:0x20]
-        data = key0[0x20:0x20 + data_len]
+        data = key0[0x20 : 0x20 + data_len]
         return _aes_cbc_decrypt(boot_key, salt, data)[:16]
 
     if revision == 0x01:
@@ -381,9 +386,7 @@ def derive_hashed_bootkey(f_value: bytes, boot_key: bytes) -> bytes:
         rc4_key = hashlib.md5(salt + _AQWERTY + boot_key + _ANUM).digest()
         decrypted = _arc4(rc4_key, key + checksum)
         hashed_bk = decrypted[:16]
-        expected = hashlib.md5(
-            hashed_bk + _ANUM + _AQWERTY + hashed_bk
-        ).digest()
+        expected = hashlib.md5(hashed_bk + _ANUM + _AQWERTY + hashed_bk).digest()
         if expected != decrypted[16:32]:
             log_runtime.warning(
                 "Hashed BootKey checksum mismatch - decryption may be wrong"
@@ -427,6 +430,7 @@ def derive_hashed_bootkey(f_value: bytes, boot_key: bytes) -> bytes:
 # one. References: impacket ``secretsdump.SAM_HASH`` /
 # ``SAM_HASH_AES``.
 
+
 def _decrypt_hash_slot(
     enc_blob: bytes,
     hashed_bk: bytes,
@@ -459,7 +463,7 @@ def _decrypt_hash_slot(
             return []
         salt = enc_blob[8:24]
         ct = enc_blob[24:]
-        ct = ct[:len(ct) - (len(ct) % 16)]
+        ct = ct[: len(ct) - (len(ct) % 16)]
         if not ct:
             return []
         plain = _aes_cbc_decrypt(hashed_bk, salt, ct)
@@ -467,10 +471,7 @@ def _decrypt_hash_slot(
         log_runtime.warning("Unknown SAM hash revision %#x", revision)
         return []
 
-    return [
-        _rid_unwrap(plain[i:i + 16], rid)
-        for i in range(0, len(plain) - 15, 16)
-    ]
+    return [_rid_unwrap(plain[i : i + 16], rid) for i in range(0, len(plain) - 15, 16)]
 
 
 # --------------------------------------------------------------------------- #
@@ -503,6 +504,7 @@ _V_DATA_BASE = 0xCC
 @dataclass
 class _UserV:
     """Strings + raw hash slots extracted from a USER_ACCOUNT_V buffer."""
+
     name: str = ""
     full_name: str = ""
     comment: str = ""
@@ -526,7 +528,7 @@ def _v_slice(v: bytes, slot_off: int) -> bytes:
     ln = _u32(v, slot_off + 4)
     if not ln:
         return b""
-    return v[_V_DATA_BASE + off:_V_DATA_BASE + off + ln]
+    return v[_V_DATA_BASE + off : _V_DATA_BASE + off + ln]
 
 
 def _v_str(v: bytes, slot_off: int) -> str:
@@ -578,9 +580,11 @@ def _parse_user_v(v: bytes) -> _UserV:
 #   0x4C  BadPasswordCount     (u16)
 #   0x4E  LogonCount           (u16)
 
+
 @dataclass
 class _UserF:
     """Numeric / timestamp fields extracted from a USER_ACCOUNT_F buffer."""
+
     last_logon: int = 0
     last_logoff: int = 0
     password_last_set: int = 0
@@ -644,9 +648,11 @@ def _parse_user_f(f: bytes) -> _UserF:
 #   0x5C  ServerRole                         (u16)  [MS-SAMR] §2.2.4.16
 #   0x5E  UasCompatibilityRequired           (u16)
 
+
 @dataclass
 class SamDomainPolicy:
     """Password & lockout policy parsed from SAM_DOMAIN_ACCOUNT_F."""
+
     creation_time: int = 0
     domain_modified_count: int = 0
     max_password_age: int = 0
@@ -753,9 +759,9 @@ def _parse_sids(buf: bytes, count: int) -> list[str]:
         if p + size > len(buf):
             break
         try:
-            sids.append(WINNT_SID(buf[p:p + size]).summary())
+            sids.append(WINNT_SID(buf[p : p + size]).summary())
         except Exception:
-            sids.append(buf[p:p + size].hex())
+            sids.append(buf[p : p + size].hex())
         p += size
     return sids
 
@@ -773,12 +779,14 @@ def _parse_alias_c(domain: str, fallback_rid: int, c: bytes) -> SamAlias:
     return SamAlias(
         domain=domain,
         alias_id=_u32(c, 0x00) or fallback_rid,
-        name=c[base + name_off:base + name_off + name_len]
-              .decode("utf-16-le", errors="replace"),
-        comment=c[base + comment_off:base + comment_off + comment_len]
-                 .decode("utf-16-le", errors="replace"),
+        name=c[base + name_off : base + name_off + name_len].decode(
+            "utf-16-le", errors="replace"
+        ),
+        comment=c[base + comment_off : base + comment_off + comment_len].decode(
+            "utf-16-le", errors="replace"
+        ),
         members=_parse_sids(
-            c[base + members_off:base + members_off + members_len],
+            c[base + members_off : base + members_off + members_len],
             num_members,
         ),
     )
@@ -814,9 +822,7 @@ def dump_aliases(client: RegClient) -> list[SamAlias]:
             try:
                 out.append(_parse_alias_c(domain, alias_rid, cval))
             except (struct.error, IndexError) as exc:
-                log_runtime.warning(
-                    "alias %s\\%s: parse error: %s", domain, name, exc
-                )
+                log_runtime.warning("alias %s\\%s: parse error: %s", domain, name, exc)
                 continue
     return out
 
@@ -839,7 +845,7 @@ def _get_machine_sid(client: RegClient) -> str:
     if pos < 0 or pos + 24 > len(v):
         return ""
     try:
-        return WINNT_SID(v[pos:pos + 24]).summary()
+        return WINNT_SID(v[pos : pos + 24]).summary()
     except Exception:
         return ""
 
@@ -847,6 +853,7 @@ def _get_machine_sid(client: RegClient) -> str:
 # --------------------------------------------------------------------------- #
 # Public account dataclass
 # --------------------------------------------------------------------------- #
+
 
 @dataclass
 class SamUser:
@@ -893,6 +900,7 @@ class SamUser:
 # User dump
 # --------------------------------------------------------------------------- #
 
+
 def dump_users(client: RegClient, hashed_bk: bytes) -> list[SamUser]:
     r"""
     Walk ``SAM\Domains\Account\Users\<RID>`` and decode V & F for each
@@ -926,41 +934,39 @@ def dump_users(client: RegClient, hashed_bk: bytes) -> list[SamUser]:
 
         lm_list = _decrypt_hash_slot(v.enc_lm, hashed_bk, rid, _LMPASSWORD)
         nt_list = _decrypt_hash_slot(v.enc_nt, hashed_bk, rid, _NTPASSWORD)
-        lm_hist = _decrypt_hash_slot(
-            v.enc_lm_history, hashed_bk, rid, _LMPASSWORD
-        )
-        nt_hist = _decrypt_hash_slot(
-            v.enc_nt_history, hashed_bk, rid, _NTPASSWORD
-        )
+        lm_hist = _decrypt_hash_slot(v.enc_lm_history, hashed_bk, rid, _LMPASSWORD)
+        nt_hist = _decrypt_hash_slot(v.enc_nt_history, hashed_bk, rid, _NTPASSWORD)
 
-        users.append(SamUser(
-            rid=rid,
-            username=v.name,
-            full_name=v.full_name,
-            comment=v.comment,
-            user_comment=v.user_comment,
-            home_dir=v.home_dir,
-            home_dir_drive=v.home_dir_drive,
-            script_path=v.script_path,
-            profile_path=v.profile_path,
-            workstations=v.workstations,
-            logon_hours=v.logon_hours,
-            last_logon=f.last_logon,
-            last_logoff=f.last_logoff,
-            password_last_set=f.password_last_set,
-            account_expires=f.account_expires,
-            password_can_change=f.password_can_change,
-            user_account_control=f.user_account_control,
-            primary_group=f.primary_group,
-            country_code=f.country_code,
-            code_page=f.code_page,
-            bad_password_count=f.bad_password_count,
-            logon_count=f.logon_count,
-            lm_hash=lm_list[0] if lm_list else _EMPTY_LM,
-            nt_hash=nt_list[0] if nt_list else _EMPTY_NT,
-            nt_history=nt_hist,
-            lm_history=lm_hist,
-        ))
+        users.append(
+            SamUser(
+                rid=rid,
+                username=v.name,
+                full_name=v.full_name,
+                comment=v.comment,
+                user_comment=v.user_comment,
+                home_dir=v.home_dir,
+                home_dir_drive=v.home_dir_drive,
+                script_path=v.script_path,
+                profile_path=v.profile_path,
+                workstations=v.workstations,
+                logon_hours=v.logon_hours,
+                last_logon=f.last_logon,
+                last_logoff=f.last_logoff,
+                password_last_set=f.password_last_set,
+                account_expires=f.account_expires,
+                password_can_change=f.password_can_change,
+                user_account_control=f.user_account_control,
+                primary_group=f.primary_group,
+                country_code=f.country_code,
+                code_page=f.code_page,
+                bad_password_count=f.bad_password_count,
+                logon_count=f.logon_count,
+                lm_hash=lm_list[0] if lm_list else _EMPTY_LM,
+                nt_hash=nt_list[0] if nt_list else _EMPTY_NT,
+                nt_history=nt_hist,
+                lm_history=lm_hist,
+            )
+        )
     return users
 
 
@@ -968,28 +974,41 @@ def dump_users(client: RegClient, hashed_bk: bytes) -> list[SamUser]:
 # Output rendering
 # --------------------------------------------------------------------------- #
 
+
 def _print_domain(policy: SamDomainPolicy) -> None:
     """Render the domain-level password / lockout policy."""
     _banner("Domain policy (SAM\\Domains\\Account\\F)")
     role = _SERVER_ROLES.get(policy.server_role, str(policy.server_role))
-    print(f"  Creation time              : "
-          f"{_filetime_to_iso(policy.creation_time)}")
+    print(
+        f"  Creation time              : " f"{_filetime_to_iso(policy.creation_time)}"
+    )
     print(f"  Domain modified count      : {policy.domain_modified_count}")
-    print(f"  Min password age           : "
-          f"{_filetime_interval(policy.min_password_age)}")
-    print(f"  Max password age           : "
-          f"{_filetime_interval(policy.max_password_age)}")
-    print(f"  Force logoff               : "
-          f"{_filetime_interval(policy.force_logoff)}")
-    print(f"  Lockout duration           : "
-          f"{_filetime_interval(policy.lockout_duration)}")
-    print(f"  Lockout observation window : "
-          f"{_filetime_interval(policy.lockout_observation_window)}")
+    print(
+        f"  Min password age           : "
+        f"{_filetime_interval(policy.min_password_age)}"
+    )
+    print(
+        f"  Max password age           : "
+        f"{_filetime_interval(policy.max_password_age)}"
+    )
+    print(
+        f"  Force logoff               : " f"{_filetime_interval(policy.force_logoff)}"
+    )
+    print(
+        f"  Lockout duration           : "
+        f"{_filetime_interval(policy.lockout_duration)}"
+    )
+    print(
+        f"  Lockout observation window : "
+        f"{_filetime_interval(policy.lockout_observation_window)}"
+    )
     print(f"  Lockout threshold          : {policy.lockout_threshold}")
     print(f"  Min password length        : {policy.min_password_length}")
     print(f"  Password history length    : {policy.password_history_length}")
-    print(f"  Password properties        : "
-          f"{_decode_flags(policy.password_properties, _PWD_PROPERTIES)}")
+    print(
+        f"  Password properties        : "
+        f"{_decode_flags(policy.password_properties, _PWD_PROPERTIES)}"
+    )
     print(f"  Server role                : {role}")
     print(f"  Server state               : 0x{policy.server_state:x}")
     print(f"  Next RID                   : {policy.next_rid}")
@@ -997,7 +1016,9 @@ def _print_domain(policy: SamDomainPolicy) -> None:
 
 
 def _print_user(
-    u: SamUser, admin_rids: set, rid_to_groups: dict,
+    u: SamUser,
+    admin_rids: set,
+    rid_to_groups: dict,
 ) -> None:
     """Render one SamUser block, with admin / disabled highlights and
     inline local-group membership."""
@@ -1032,19 +1053,18 @@ def _print_user(
         print(f"  Profile path          : {u.profile_path}")
     if u.workstations:
         print(f"  Workstations          : {u.workstations}")
-    print(f"  UAC                   : "
-          f"{_decode_uac_colored(u.user_account_control)}")
+    print(
+        f"  UAC                   : " f"{_decode_uac_colored(u.user_account_control)}"
+    )
     print(f"  Primary group         : {u.primary_group}")
     print(f"  Country / code page   : {u.country_code} / {u.code_page}")
     print(f"  Bad password count    : {u.bad_password_count}")
     print(f"  Logon count           : {u.logon_count}")
     print(f"  Last logon            : {_filetime_to_iso(u.last_logon)}")
     print(f"  Last logoff           : {_filetime_to_iso(u.last_logoff)}")
-    print(f"  Password last set     : "
-          f"{_filetime_to_iso(u.password_last_set)}")
+    print(f"  Password last set     : " f"{_filetime_to_iso(u.password_last_set)}")
     print(f"  Account expires       : {_filetime_to_iso(u.account_expires)}")
-    print(f"  Password can change   : "
-          f"{_filetime_to_iso(u.password_can_change)}")
+    print(f"  Password can change   : " f"{_filetime_to_iso(u.password_can_change)}")
     if u.logon_hours:
         if u.logon_hours == b"\xff" * len(u.logon_hours):
             hours = "(any)"
@@ -1114,13 +1134,12 @@ def _print_aliases(
     HOT_ALIASES = ((544, "Administrators"), (555, "Remote Desktop Users"))
     for hot_rid, label in HOT_ALIASES:
         target = next(
-            (a for a in aliases
-             if a.domain == "Builtin" and a.alias_id == hot_rid),
+            (a for a in aliases if a.domain == "Builtin" and a.alias_id == hot_rid),
             None,
         )
         if target is None:
             continue
-        is_admins = (hot_rid == 544)
+        is_admins = hot_rid == 544
         bar = ct.red if is_admins else ct.cyan
         print(bar("=" * 64))
         print(bar(ct.bold(f"{label} (BUILTIN RID {hot_rid})")))
@@ -1143,17 +1162,14 @@ def _print_aliases(
         print(f"  Machine SID: {ct.cyan(machine_sid)}")
         print()
     hot_set = {rid for rid, _ in HOT_ALIASES}
-    for a in sorted(
-        aliases, key=lambda x: (x.domain != "Builtin", x.alias_id)
-    ):
+    for a in sorted(aliases, key=lambda x: (x.domain != "Builtin", x.alias_id)):
         # The two HOT aliases are already rendered above; skip empty,
         # undescribed groups to keep the output tight.
         if a.domain == "Builtin" and a.alias_id in hot_set:
             continue
         if not a.members and not a.comment:
             continue
-        header = (f"  {a.domain}\\{a.name}  "
-                  f"(RID {a.alias_id} / 0x{a.alias_id:x})")
+        header = f"  {a.domain}\\{a.name}  " f"(RID {a.alias_id} / 0x{a.alias_id:x})"
         print(ct.bold(header))
         if a.comment:
             print(f"    Comment: {a.comment}")
@@ -1170,6 +1186,7 @@ def _print_aliases(
 # JSON serialization
 # --------------------------------------------------------------------------- #
 
+
 def _jsonify(obj):
     """Recursively convert ``bytes`` values to hex strings so a
     :func:`dataclasses.asdict` tree round-trips through ``json.dumps``."""
@@ -1185,6 +1202,7 @@ def _jsonify(obj):
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
+
 
 def samhive(
     target: str,
@@ -1282,23 +1300,27 @@ def samhive(
 
     if pwdump:
         for u in users:
-            print(f"{u.username}:{u.rid}:{u.lm_hash.hex()}:"
-                  f"{u.nt_hash.hex()}:::")
+            print(f"{u.username}:{u.rid}:{u.lm_hash.hex()}:" f"{u.nt_hash.hex()}:::")
         return
 
     if json_out:
         import json as _json
-        print(_json.dumps(
-            _jsonify({
-                "boot_key": boot_key,
-                "hashed_boot_key": hashed_bk,
-                "machine_sid": machine_sid,
-                "domain_policy": asdict(domain_policy),
-                "users": [asdict(u) for u in users],
-                "aliases": [asdict(a) for a in aliases],
-            }),
-            indent=2,
-        ))
+
+        print(
+            _json.dumps(
+                _jsonify(
+                    {
+                        "boot_key": boot_key,
+                        "hashed_boot_key": hashed_bk,
+                        "machine_sid": machine_sid,
+                        "domain_policy": asdict(domain_policy),
+                        "users": [asdict(u) for u in users],
+                        "aliases": [asdict(a) for a in aliases],
+                    }
+                ),
+                indent=2,
+            )
+        )
         return
 
     # Build a full RID -> [group display name] mapping for the inline
@@ -1315,9 +1337,7 @@ def samhive(
                 rid = int(sid.rsplit("-", 1)[1])
             except ValueError:
                 continue
-            rid_to_groups.setdefault(rid, []).append(
-                f"{a.domain}\\{a.name}"
-            )
+            rid_to_groups.setdefault(rid, []).append(f"{a.domain}\\{a.name}")
             if a.domain == "Builtin" and a.alias_id == 544:
                 admin_rids.add(rid)
 
@@ -1332,7 +1352,10 @@ def samhive(
         _print_user(u, admin_rids, rid_to_groups)
     rid_to_user = {u.rid: u.username for u in users}
     _print_aliases(
-        aliases, machine_sid, rid_to_user, all_groups=all_groups,
+        aliases,
+        machine_sid,
+        rid_to_user,
+        all_groups=all_groups,
     )
 
 
