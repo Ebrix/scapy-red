@@ -372,6 +372,87 @@ class RegHiveClient(CLIUtil):
         return self.ls_complete(subkey)
 
     # --------------------------------------------- #
+    #                       Tree
+    # --------------------------------------------- #
+
+    @CLIUtil.addcommand(mono=True)
+    def tree(
+        self,
+        subkey: str | None = None,
+        depth: int = 3,
+        values: bool = False,
+    ) -> list[str]:
+        """
+        Display the subkey hierarchy below `subkey` as a tree.
+
+        :param subkey: the relative subkey to root the tree at.
+                       If None, uses the current subkey path.
+        :param depth: maximum number of levels to descend (default 3).
+                      Use -1 for unlimited depth.
+        :param values: if set, also show each key's registry values as
+                       leaf nodes.
+
+        :return: the list of pre-rendered (already colorized) output lines.
+        """
+        if self._resolve(subkey) is None:
+            log_runtime.error("No such subkey: %s", subkey)
+            return []
+        header = self._join_path(self.current_subkey_path, subkey or "")
+        lines = [f"\\{header}"]
+        lines += self._tree_lines(subkey, "", depth, values)
+        return lines
+
+    def _tree_lines(
+        self, path: str | None, prefix: str, depth: int, values: bool
+    ) -> list[str]:
+        """
+        Recursively build the tree lines below ``path`` (relative to the
+        current key). ``prefix`` is the accumulated branch drawing; only the
+        node names are colorized, so the connectors stay aligned.
+        """
+        ct = conf.color_theme
+
+        # Subkeys (containers) first, then values (leaves) when requested.
+        children = [(name, True) for name in self.ls(path)]
+        if values:
+            children += [(entry, False) for entry in self.cat(path)]
+
+        lines: list[str] = []
+        for i, (child, is_key) in enumerate(children):
+            last = i == len(children) - 1
+            connector = "└── " if last else "├── "
+            if is_key:
+                name = ct.blue(child)
+            else:
+                label = child.reg_name or "(Default)"
+                name = ct.green(f"{label} ({child.reg_type.name})")
+            lines.append(prefix + connector + name)
+
+            # Recurse into subkeys while there is depth budget (-1 = unlimited).
+            if is_key and (depth > 1 or depth < 0):
+                extension = "    " if last else "│   "
+                child_path = str(self._join_path(path or "", child))
+                lines += self._tree_lines(
+                    child_path, prefix + extension, depth - 1, values
+                )
+        return lines
+
+    @CLIUtil.addoutput(tree)
+    def tree_output(self, results: list[str]) -> None:
+        """
+        Print the output of 'tree'
+        """
+        for line in results:
+            print(line)
+
+    @CLIUtil.addcomplete(tree)
+    def tree_complete(self, subkey: str) -> list[str]:
+        """
+        Auto-complete tree
+        """
+        return self.ls_complete(subkey)
+
+    # --------------------------------------------- #
     #                   Change Directory
     # --------------------------------------------- #
 
