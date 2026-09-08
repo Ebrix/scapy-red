@@ -1,0 +1,11 @@
+# List the Group Policy Client Side Extensions (CSEs) registered on the host.
+# Each subkey of GPExtensions is a CSE GUID. Its (Default) value - referenced
+# below by the empty string "" - holds the friendly name (e.g. "Folder
+# Redirection"); DllName is the extension DLL that implements it. Read-only.
+title = "List Group Policy Client Side Extensions"
+short = "gpo-cse"
+
+[[actions]]
+op     = "enum"
+key    = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\GPExtensions"
+values = ["", "DllName"]

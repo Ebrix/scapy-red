@@ -1,0 +1,304 @@
+% Tests for the regmodule module in scapy-red
+
+# More information at http://www.secdev.org/projects/UTscapy/
+#
+# These tests are fully local: they never open a network connection. The
+# registry-touching parts of regmodule are exercised through a fake client that
+# only records the calls it receives, so the whole file runs on any platform.
+
+############
+# RegModule
+############
+
++ RegModule tests
+
+= RegModule - Imports and fixtures
+
+import os
+import pathlib
+import tempfile
+
+from scapyred import regmodule
+from scapyred.regmodule import (
+    _split_key,
+    _validate_module,
+    _load_module_file,
+    _discover_modules,
+    _resolve_module,
+    _module_mutates,
+    _describe_action,
+    _apply_action,
+    _BUILTIN_MODULES_DIR,
+)
+
+
+class FakeEntry:
+    "Minimal stand-in for winreg.RegEntry (only reg_name/reg_data are used)."
+    def __init__(self, reg_name, reg_data):
+        self.reg_name = reg_name
+        self.reg_data = reg_data
+
+
+class FakeClient:
+    "Records every RegClient call regmodule makes, without any network."
+    def __init__(self, values=None, subkeys=None):
+        self.calls = []
+        self._values = values if values is not None else [
+            FakeEntry("DisplayName", "App"),
+            FakeEntry("Publisher", "Vendor"),
+        ]
+        self._subkeys = subkeys if subkeys is not None else ["Alpha", "Beta"]
+
+    def use(self, root):
+        self.calls.append(("use", root))
+        return (root, object())
+
+    def set_value(self, name, vtype, data, subkey=None):
+        self.calls.append(("set_value", name, vtype, data, subkey))
+
+    def create_key(self, leaf, subkey=None):
+        self.calls.append(("create_key", leaf, subkey))
+        return True
+
+    def delete_value(self, name, subkey=None):
+        self.calls.append(("delete_value", name, subkey))
+        return True
+
+    def delete_key(self, subkey=None):
+        self.calls.append(("delete_key", subkey))
+        return True
+
+    def ls(self, subkey=None):
+        self.calls.append(("ls", subkey))
+        return list(self._subkeys)
+
+    def ls_output(self, results):
+        self.calls.append(("ls_output", list(results)))
+
+    def cat(self, subkey=None):
+        self.calls.append(("cat", subkey))
+        return list(self._values)
+
+    def cat_output(self, results):
+        self.calls.append(("cat_output", len(list(results))))
+
+
+def names(client):
+    "The ordered list of method names the client received."
+    return [c[0] for c in client.calls]
+
+= RegModule - _split_key parses root + subpath
+
+assert _split_key("HKLM") == ("HKLM", "")
+assert _split_key("HKLM\\SYSTEM\\Foo") == ("HKLM", "SYSTEM\\Foo")
+# Forward slashes and stray leading/trailing separators are normalized.
+assert _split_key("HKLM/SOFTWARE/Bar") == ("HKLM", "SOFTWARE\\Bar")
+assert _split_key("\\HKCU\\Environment\\") == ("HKCU", "Environment")
+
+= RegModule - _split_key rejects unknown roots
+
+try:
+    _split_key("HKEY_NOPE\\Foo")
+    assert False, "expected ValueError for unknown root"
+except ValueError:
+    pass
+
+= RegModule - _validate_module accepts a well-formed module
+
+good = {
+    "title": "T",
+    "short": "s",
+    "key": "HKLM\\SOFTWARE\\X",
+    "actions": [
+        {"op": "set_value", "name": "n", "type": "REG_SZ", "data": "d"},
+        {"op": "list", "key": "HKLM\\SOFTWARE"},
+    ],
+}
+assert _validate_module(good, "test") is good
+
+= RegModule - _validate_module rejects missing top-level fields
+
+for missing in ("title", "short", "actions"):
+    bad = {"title": "T", "short": "s", "actions": [{"op": "cat"}]}
+    del bad[missing]
+    try:
+        _validate_module(bad, "test")
+        assert False, "expected ValueError for missing %s" % missing
+    except ValueError:
+        pass
+
+= RegModule - _validate_module rejects empty / non-list actions
+
+for actions in ([], "nope", None):
+    bad = {"title": "T", "short": "s", "actions": actions}
+    try:
+        _validate_module(bad, "test")
+        assert False, "expected ValueError for actions=%r" % (actions,)
+    except ValueError:
+        pass
+
+= RegModule - _validate_module rejects unknown op
+
+bad = {"title": "T", "short": "s", "key": "HKLM", "actions": [{"op": "frobnicate"}]}
+try:
+    _validate_module(bad, "test")
+    assert False, "expected ValueError for unknown op"
+except ValueError:
+    pass
+
+= RegModule - _validate_module requires per-op fields
+
+# set_value needs name/type/data
+bad = {"title": "T", "short": "s", "key": "HKLM", "actions": [{"op": "set_value", "name": "n"}]}
+try:
+    _validate_module(bad, "test")
+    assert False, "expected ValueError for incomplete set_value"
+except ValueError:
+    pass
+
+= RegModule - _validate_module requires a key (default or per-action)
+
+bad = {"title": "T", "short": "s", "actions": [{"op": "cat"}]}
+try:
+    _validate_module(bad, "test")
+    assert False, "expected ValueError when no key is available"
+except ValueError:
+    pass
+
+# But a per-action key satisfies the requirement even without a module default.
+ok = {"title": "T", "short": "s", "actions": [{"op": "cat", "key": "HKLM\\X"}]}
+assert _validate_module(ok, "test") is ok
+
+= RegModule - _validate_module checks enum 'values' type
+
+bad = {
+    "title": "T", "short": "s", "key": "HKLM",
+    "actions": [{"op": "enum", "values": "notalist"}],
+}
+try:
+    _validate_module(bad, "test")
+    assert False, "expected ValueError for non-list enum values"
+except ValueError:
+    pass
+
+ok = {
+    "title": "T", "short": "s", "key": "HKLM",
+    "actions": [{"op": "enum", "values": ["DisplayName"]}],
+}
+assert _validate_module(ok, "test") is ok
+
+= RegModule - shipped modules load and resolve
+
+# The package ships at least rdp-on and software-list; they must parse.
+rdp_path = _BUILTIN_MODULES_DIR / "rdp-on.toml"
+rdp = _load_module_file(rdp_path)
+assert rdp["short"] == "rdp-on"
+
+discovered = {data["short"] for _, data in _discover_modules(None)}
+assert "rdp-on" in discovered
+assert "software-list" in discovered
+
+path, data = _resolve_module("rdp-on", None)
+assert data["short"] == "rdp-on"
+
+try:
+    _resolve_module("does-not-exist", None)
+    assert False, "expected ValueError for unknown short name"
+except ValueError:
+    pass
+
+= RegModule - _module_mutates distinguishes read-only vs mutating
+
+assert _module_mutates(rdp) is True  # rdp-on does set_value
+_, soft = _resolve_module("software-list", None)
+assert _module_mutates(soft) is False  # software-list only enumerates
+
+readonly = {"actions": [{"op": "list"}, {"op": "cat"}, {"op": "read", "name": "x"}]}
+assert _module_mutates(readonly) is False
+
+= RegModule - _discover_modules reads a custom directory
+
+tmpdir = tempfile.mkdtemp()
+p = pathlib.Path(tmpdir) / "custom.toml"
+p.write_text(
+    'title = "Custom"\nshort = "custom-x"\nkey = "HKLM\\\\X"\n'
+    '[[actions]]\nop = "cat"\n'
+)
+shorts = {data["short"] for _, data in _discover_modules(tmpdir)}
+assert "custom-x" in shorts
+cpath, cdata = _resolve_module("custom-x", tmpdir)
+assert cdata["title"] == "Custom"
+
+= RegModule - _describe_action renders each op
+
+d = _describe_action
+assert d({"op": "set_value", "name": "n", "type": "REG_SZ", "data": "0"}, "HKLM\\X").startswith("set_value")
+assert d({"op": "create_key"}, "HKLM\\X\\Y").startswith("create_key")
+assert d({"op": "delete_value", "name": "n"}, "HKLM\\X").startswith("delete_value")
+assert d({"op": "delete_key"}, "HKLM\\X").startswith("delete_key")
+assert d({"op": "read", "name": "n"}, "HKLM\\X").startswith("read")
+desc = d({"op": "enum", "values": ["DisplayName", "Publisher"]}, "HKLM\\U")
+assert desc.startswith("enum")
+assert "DisplayName" in desc and "Publisher" in desc
+
+= RegModule - _apply_action dispatches set_value
+
+c = FakeClient()
+assert _apply_action(c, {"op": "set_value", "name": "n", "type": "REG_DWORD", "data": 0}, "HKLM\\SOFTWARE\\X") is True
+assert ("use", "HKLM") in c.calls
+sv = [x for x in c.calls if x[0] == "set_value"][0]
+# name, type, str(data), subkey relative to root
+assert sv == ("set_value", "n", "REG_DWORD", "0", "SOFTWARE\\X")
+
+= RegModule - _apply_action splits create_key into parent + leaf
+
+c = FakeClient()
+assert _apply_action(c, {"op": "create_key"}, "HKLM\\SOFTWARE\\Foo\\Bar") is True
+ck = [x for x in c.calls if x[0] == "create_key"][0]
+assert ck == ("create_key", "Bar", "SOFTWARE\\Foo")
+
+# A one-level key has an empty parent.
+c = FakeClient()
+_apply_action(c, {"op": "create_key"}, "HKLM\\NewTop")
+ck = [x for x in c.calls if x[0] == "create_key"][0]
+assert ck == ("create_key", "NewTop", "")
+
+= RegModule - _apply_action dispatches delete_value / delete_key
+
+c = FakeClient()
+_apply_action(c, {"op": "delete_value", "name": "v"}, "HKLM\\SOFTWARE\\X")
+assert ("delete_value", "v", "SOFTWARE\\X") in c.calls
+
+c = FakeClient()
+_apply_action(c, {"op": "delete_key"}, "HKLM\\SOFTWARE\\X")
+assert ("delete_key", "SOFTWARE\\X") in c.calls
+
+= RegModule - _apply_action read finds a matching value
+
+c = FakeClient(values=[FakeEntry("Wanted", "yes"), FakeEntry("Other", "no")])
+assert _apply_action(c, {"op": "read", "name": "Wanted"}, "HKLM\\X") is True
+# It cats the key and prints the single match via cat_output.
+assert "cat" in names(c)
+co = [x for x in c.calls if x[0] == "cat_output"][0]
+assert co == ("cat_output", 1)
+
+= RegModule - _apply_action enum reads values per subkey
+
+c = FakeClient(
+    subkeys=["App1", "App2"],
+    values=[FakeEntry("DisplayName", "Cool App"), FakeEntry("Publisher", "Vendor")],
+)
+assert _apply_action(c, {"op": "enum", "values": ["DisplayName"]}, "HKLM\\U") is True
+# One ls to list subkeys, then one cat per subkey.
+assert names(c).count("cat") == 2
+ls_call = [x for x in c.calls if x[0] == "ls"][0]
+assert ls_call == ("ls", "U")
+
+= RegModule - _apply_action returns False when a RegClient method raises
+
+class BoomClient(FakeClient):
+    def create_key(self, leaf, subkey=None):
+        raise RuntimeError("boom")
+
+c = BoomClient()
+assert _apply_action(c, {"op": "create_key"}, "HKLM\\X\\Y") is False
