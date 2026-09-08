@@ -84,6 +84,7 @@ def lsamgr(
     right: str = None,
     sid: str = None,
     use_krb5ccname: bool = False,
+    use_winssp: bool = False,
     ssp=None,
 ):
     r"""
@@ -98,6 +99,10 @@ def lsamgr(
     :param HashNt: if provided, used for auth (NTLM)
     :param HashAes256Sha96: if provided, used for auth (Kerberos)
     :param HashAes128Sha96: if provided, used for auth (Kerberos)
+    :param use_krb5ccname: (bool) if true, the KRB5CCNAME environment variable will
+                            be used if available.
+    :param use_winssp: (bool) (only works on Windows). Use implicit authentication
+                        through WinSSP.
     """
 
     if action not in ["enumerate", "add", "delete"]:
@@ -113,6 +118,7 @@ def lsamgr(
             HashAes128Sha96=HashAes128Sha96,
             kerberos_required=kerberos_required,
             use_krb5ccname=use_krb5ccname,
+            use_winssp=use_winssp,
         )
 
     # Establish connection
